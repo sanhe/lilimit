@@ -124,7 +124,7 @@ make tauri-build
 - Press `Cmd+Shift+L` on macOS or `Ctrl+Shift+L` on Linux to show or hide the widget.
 - lilimit refreshes `collected_snapshot.json` at most every 5 minutes from local CLI OAuth credentials.
 - Codex usage is read from the OAuth tokens in `~/.codex/auth.json` and fetched from the ChatGPT usage endpoint. API-key-only Codex auth cannot read these usage stats.
-- Claude usage is read from `~/.claude/.credentials.json` and fetched from Anthropic's OAuth usage endpoint. On macOS, optional Keychain access can read Claude Code's credential item when explicitly enabled. Claude refreshes are rate-limited to 5 minutes, and Anthropic `429` responses use exponential backoff while keeping the last successful Claude data visible as stale.
+- Claude usage is read from `~/.claude/.credentials.json` and fetched from Anthropic's OAuth usage endpoint. On macOS, optional Keychain access can read Claude Code's credential item when explicitly enabled. Claude Code owns these credentials, so lilimit does not refresh expired Claude OAuth tokens directly; run `claude` to refresh or re-authenticate them. Claude refreshes are rate-limited to 5 minutes, and Anthropic `429` responses use exponential backoff while keeping the last successful Claude data visible as stale.
 - Browser cookie import and Chrome Keychain cookie decryption are intentionally not implemented; lilimit uses local CLI OAuth credentials instead.
 - Display preferences and the last reported window position are stored in lilimit's local `settings.json`.
 - Always-on-top behavior is compositor-dependent on Ubuntu. GNOME on X11 usually honors it more consistently than GNOME on Wayland.

@@ -40,8 +40,6 @@ const CODEX_REFRESH_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
 const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CODEX_DEFAULT_CHATGPT_BASE_URL: &str = "https://chatgpt.com/backend-api";
 const CLAUDE_OAUTH_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
-const CLAUDE_REFRESH_ENDPOINT: &str = "https://platform.claude.com/v1/oauth/token";
-const CLAUDE_OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 #[cfg(target_os = "macos")]
 const CLAUDE_KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 #[cfg(target_os = "macos")]
@@ -558,6 +556,7 @@ where
 #[derive(Debug)]
 enum UsageFetchError {
     Unauthorized,
+    AuthenticationRequired(String),
     RateLimited(Option<DateTime<Utc>>),
     Message(String),
 }
@@ -566,6 +565,7 @@ impl std::fmt::Display for UsageFetchError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             UsageFetchError::Unauthorized => write!(formatter, "unauthorized"),
+            UsageFetchError::AuthenticationRequired(message) => write!(formatter, "{message}"),
             UsageFetchError::RateLimited(Some(retry_at)) => write!(
                 formatter,
                 "rate limited; retry {}",
@@ -592,9 +592,6 @@ struct ClaudeCredentials {
     access_token: String,
     refresh_token: Option<String>,
     expires_at_ms: Option<f64>,
-    scopes: Vec<String>,
-    rate_limit_tier: Option<String>,
-    subscription_type: Option<String>,
     path: Option<PathBuf>,
 }
 
@@ -774,7 +771,12 @@ async fn refresh_collected_usage_snapshot(
             providers.push(provider);
             errors.push(format!("Claude: {warning}"));
         }
-        ClaudeCollectionResult::Unavailable(error) => errors.push(format!("Claude: {error}")),
+        ClaudeCollectionResult::Unavailable(error) => {
+            if !providers.is_empty() || previous_snapshot.is_some() {
+                providers.push(unavailable_provider("Claude", error.clone()));
+            }
+            errors.push(format!("Claude: {error}"));
+        }
     }
     write_collector_state(&collector_state)?;
 
@@ -819,6 +821,26 @@ fn write_collected_usage_snapshot(snapshot: &UsageSnapshotFile) -> Result<(), St
     }
     let contents = serde_json::to_string_pretty(snapshot).map_err(|error| error.to_string())?;
     fs::write(path, contents).map_err(|error| error.to_string())
+}
+
+fn unavailable_provider(name: &str, error: String) -> ProviderUsage {
+    ProviderUsage {
+        name: name.to_string(),
+        session_left_percent: None,
+        weekly_left_percent: None,
+        reset_text: "auth".to_string(),
+        updated_at: None,
+        usage_rows: Vec::new(),
+        primary: None,
+        secondary: None,
+        tertiary: None,
+        credits_remaining: None,
+        code_review_remaining_percent: None,
+        token_usage: None,
+        daily_usage: Vec::new(),
+        stale: true,
+        error: Some(error),
+    }
 }
 
 fn response_from_snapshot_file(
@@ -957,6 +979,7 @@ fn claude_backoff_duration(failures: u32) -> Duration {
 
 fn should_preserve_claude_provider(error: &UsageFetchError) -> bool {
     match error {
+        UsageFetchError::AuthenticationRequired(_) => true,
         UsageFetchError::RateLimited(_) => true,
         UsageFetchError::Unauthorized => false,
         UsageFetchError::Message(message) => is_transient_claude_error(message),
@@ -1311,13 +1334,14 @@ async fn fetch_claude_provider(
     client: &reqwest::Client,
     keychain_access: KeychainAccess,
 ) -> Result<ProviderUsage, UsageFetchError> {
-    let mut credentials =
-        load_claude_credentials(keychain_access).map_err(UsageFetchError::Message)?;
+    let credentials = load_claude_credentials(keychain_access).map_err(UsageFetchError::Message)?;
     if claude_credentials_are_expired(&credentials) {
-        credentials = refresh_claude_credentials(client, &credentials).await?;
-        if credentials.path.is_some() {
-            save_claude_credentials(&credentials).map_err(UsageFetchError::Message)?;
-        }
+        // Claude Code owns these credentials. Direct refreshes can be rejected
+        // by Anthropic for CLI-owned tokens, so let `claude` refresh them.
+        return Err(UsageFetchError::AuthenticationRequired(
+            "Claude OAuth credentials are expired. Run `claude` to refresh Claude Code credentials."
+                .to_string(),
+        ));
     }
 
     let usage = fetch_claude_usage(client, &credentials).await?;
@@ -1332,9 +1356,6 @@ fn load_claude_credentials(keychain_access: KeychainAccess) -> Result<ClaudeCred
                 access_token: token,
                 refresh_token: None,
                 expires_at_ms: None,
-                scopes: vec!["user:profile".to_string()],
-                rate_limit_tier: None,
-                subscription_type: None,
                 path: None,
             });
         }
@@ -1368,25 +1389,10 @@ fn parse_claude_credentials(contents: &str) -> Result<ClaudeCredentials, String>
         "Claude OAuth access token missing. Run `claude` to authenticate.".to_string()
     })?;
 
-    let scopes = oauth
-        .get("scopes")
-        .and_then(Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(Value::as_str)
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-
     Ok(ClaudeCredentials {
         access_token,
         refresh_token: string_at(oauth, &["refreshToken"]),
         expires_at_ms: oauth.get("expiresAt").and_then(Value::as_f64),
-        scopes,
-        rate_limit_tier: string_at(oauth, &["rateLimitTier"]),
-        subscription_type: string_at(oauth, &["subscriptionType"]),
         path: None,
     })
 }
@@ -1399,108 +1405,6 @@ fn claude_credentials_are_expired(credentials: &ClaudeCredentials) -> bool {
         }
         None => credentials.refresh_token.is_some(),
     }
-}
-
-async fn refresh_claude_credentials(
-    client: &reqwest::Client,
-    credentials: &ClaudeCredentials,
-) -> Result<ClaudeCredentials, UsageFetchError> {
-    let refresh_token = credentials.refresh_token.as_ref().ok_or_else(|| {
-        UsageFetchError::Message(
-            "Claude OAuth refresh token missing. Run `claude` to authenticate.".to_string(),
-        )
-    })?;
-
-    let response = client
-        .post(CLAUDE_REFRESH_ENDPOINT)
-        .header(reqwest::header::ACCEPT, "application/json")
-        .form(&[
-            ("grant_type", "refresh_token"),
-            ("refresh_token", refresh_token.as_str()),
-            ("client_id", CLAUDE_OAUTH_CLIENT_ID),
-        ])
-        .send()
-        .await
-        .map_err(|error| UsageFetchError::Message(error.to_string()))?;
-
-    let status = response.status();
-    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        return Err(UsageFetchError::RateLimited(parse_retry_after(
-            response.headers().get(reqwest::header::RETRY_AFTER),
-        )));
-    }
-    if !status.is_success() {
-        return Err(UsageFetchError::Message(format!(
-            "Claude OAuth refresh failed with HTTP {}. Run `claude` to authenticate.",
-            status.as_u16()
-        )));
-    }
-
-    let body: Value = response
-        .json()
-        .await
-        .map_err(|error| UsageFetchError::Message(error.to_string()))?;
-    let access_token =
-        string_at(&body, &["access_token"]).unwrap_or_else(|| credentials.access_token.clone());
-    let refresh_token =
-        string_at(&body, &["refresh_token"]).or_else(|| credentials.refresh_token.clone());
-    let expires_at_ms = body
-        .get("expires_in")
-        .and_then(Value::as_i64)
-        .map(|seconds| (Utc::now().timestamp() + seconds) as f64 * 1000.0)
-        .or(credentials.expires_at_ms);
-
-    Ok(ClaudeCredentials {
-        access_token,
-        refresh_token,
-        expires_at_ms,
-        scopes: credentials.scopes.clone(),
-        rate_limit_tier: credentials.rate_limit_tier.clone(),
-        subscription_type: credentials.subscription_type.clone(),
-        path: credentials.path.clone(),
-    })
-}
-
-fn save_claude_credentials(credentials: &ClaudeCredentials) -> Result<(), String> {
-    let path = credentials
-        .path
-        .as_ref()
-        .ok_or_else(|| "Claude credentials path is unavailable.".to_string())?;
-    let contents = fs::read_to_string(path).unwrap_or_else(|_| "{}".to_string());
-    let mut value: Value = serde_json::from_str(&contents).unwrap_or_else(|_| json!({}));
-    let mut oauth = value
-        .get("claudeAiOauth")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-
-    set_string(
-        &mut oauth,
-        "accessToken",
-        Some(credentials.access_token.clone()),
-    );
-    set_string(
-        &mut oauth,
-        "refreshToken",
-        credentials.refresh_token.clone(),
-    );
-    if let Some(expires_at_ms) = credentials.expires_at_ms {
-        oauth["expiresAt"] = json!(expires_at_ms);
-    }
-    oauth["scopes"] = json!(credentials.scopes);
-    set_string(
-        &mut oauth,
-        "rateLimitTier",
-        credentials.rate_limit_tier.clone(),
-    );
-    set_string(
-        &mut oauth,
-        "subscriptionType",
-        credentials.subscription_type.clone(),
-    );
-    value["claudeAiOauth"] = oauth;
-
-    let serialized = serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?;
-    fs::write(path, serialized).map_err(|error| error.to_string())
 }
 
 async fn fetch_claude_usage(
@@ -1525,7 +1429,9 @@ async fn fetch_claude_usage(
         )));
     }
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        return Err(UsageFetchError::Unauthorized);
+        return Err(UsageFetchError::AuthenticationRequired(
+            "Claude OAuth credentials were rejected. Run `claude` to re-authenticate.".to_string(),
+        ));
     }
     if !status.is_success() {
         return Err(UsageFetchError::Message(format!(
