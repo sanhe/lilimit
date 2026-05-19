@@ -1535,10 +1535,6 @@ fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
     TrayIconBuilder::with_id("lilimit")
         .icon(tauri::include_image!("./icons/tray-template.png"))
         .icon_as_template(true)
-        // macOS renders this as visible status-item text next to the icon,
-        // which makes lilimit easy to find even when template icons blend
-        // into a crowded menu bar. Linux panel support varies by shell.
-        .title("li")
         .tooltip("lilimit")
         .menu(&menu)
         .show_menu_on_left_click(true)
