@@ -3,9 +3,10 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import "./styles.css";
 
 type UsageStatus = "ready" | "missing" | "invalidJson" | "ioError";
-type UsageSource = "codexBarWidget" | "lilimitSample";
+type UsageSource = "lilimitCollected";
 type DisplayMode = "simple" | "full";
 type WidgetBackground = "dark" | "light";
+type KeychainAccess = "off" | "allow";
 
 type WindowPosition = {
   x: number;
@@ -15,6 +16,7 @@ type WindowPosition = {
 type WidgetSettings = {
   displayMode: DisplayMode;
   background: WidgetBackground;
+  keychainAccess: KeychainAccess;
   windowPosition: WindowPosition | null;
 };
 
@@ -77,6 +79,7 @@ const STALE_MS = 15 * 60 * 1000;
 const DEFAULT_SETTINGS: WidgetSettings = {
   displayMode: "simple",
   background: "dark",
+  keychainAccess: "off",
   windowPosition: null,
 };
 const currentWindow = getCurrentWindow();
@@ -92,6 +95,7 @@ let currentSettings: WidgetSettings = DEFAULT_SETTINGS;
 let latestSnapshot: UsageSnapshot | null = null;
 let settingsOpen = false;
 let settingsError: string | null = null;
+let collectionError: string | null = null;
 let refreshInProgress = false;
 
 function clampPercent(value: number | null): number | null {
@@ -218,10 +222,8 @@ function meterWidth(value: number | null, showsUsedPercent: boolean): number {
 
 function sourceLabel(source: UsageSource | null): string {
   switch (source) {
-    case "codexBarWidget":
-      return "CodexBar";
-    case "lilimitSample":
-      return "lilimit";
+    case "lilimitCollected":
+      return "lilimit collector";
     default:
       return "local";
   }
@@ -274,6 +276,7 @@ function normalizeSettings(settings: Partial<WidgetSettings> | null): WidgetSett
   return {
     displayMode: settings?.displayMode === "full" ? "full" : "simple",
     background: settings?.background === "light" ? "light" : "dark",
+    keychainAccess: settings?.keychainAccess === "allow" ? "allow" : "off",
     windowPosition: settings?.windowPosition ?? null,
   };
 }
@@ -305,6 +308,7 @@ function fallbackRows(provider: ProviderUsage): UsageRow[] {
 function renderSettingsPanel(): string {
   const mode = currentSettings.displayMode;
   const background = currentSettings.background;
+  const keychainAccess = currentSettings.keychainAccess;
 
   return `
     <div class="settings-panel">
@@ -322,6 +326,14 @@ function renderSettingsPanel(): string {
           <button type="button" data-background="light" class="${background === "light" ? "active" : ""}">Light</button>
         </div>
       </div>
+      <div class="setting-group">
+        <span>Keychain</span>
+        <div class="segmented">
+          <button type="button" data-keychain="off" class="${keychainAccess === "off" ? "active" : ""}">Off</button>
+          <button type="button" data-keychain="allow" class="${keychainAccess === "allow" ? "active" : ""}">Allow</button>
+        </div>
+      </div>
+      <button class="settings-action refresh-button" type="button">Refresh now</button>
       ${settingsError ? `<p class="settings-error">${escapeHtml(settingsError)}</p>` : ""}
     </div>
   `;
@@ -488,6 +500,10 @@ function renderFullProvider(provider: ProviderUsage, showsUsedPercent: boolean):
 }
 
 function renderState(snapshot: UsageSnapshot): string {
+  const collectorError =
+    snapshot.status === "missing" && collectionError
+      ? `<span class="state-error">Collection failed: ${escapeHtml(collectionError)}</span>`
+      : "";
   const detail = (() => {
     if (snapshot.status === "missing") {
       return {
@@ -515,6 +531,7 @@ function renderState(snapshot: UsageSnapshot): string {
       <div class="state-body" data-tauri-drag-region>
         <p>${escapeHtml(detail.title)}</p>
         <code>${escapeHtml(detail.body)}</code>
+        ${collectorError}
       </div>
     </main>
   `;
@@ -625,10 +642,6 @@ function bindInteractions(): void {
     renderCurrent();
   });
 
-  appRoot.querySelector(".refresh-button")?.addEventListener("click", () => {
-    void refreshUsage();
-  });
-
   appRoot.querySelectorAll<HTMLButtonElement>("[data-display-mode]").forEach((button) => {
     button.addEventListener("click", () => {
       const displayMode = button.dataset.displayMode === "full" ? "full" : "simple";
@@ -642,9 +655,22 @@ function bindInteractions(): void {
       void saveSettings({ background });
     });
   });
+
+  appRoot.querySelectorAll<HTMLButtonElement>("[data-keychain]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const keychainAccess: KeychainAccess = button.dataset.keychain === "allow" ? "allow" : "off";
+      void saveSettings({ keychainAccess });
+    });
+  });
+
+  appRoot.querySelectorAll(".refresh-button").forEach((button) => {
+    button.addEventListener("click", () => {
+      void refreshUsage(true);
+    });
+  });
 }
 
-async function refreshUsage(): Promise<void> {
+async function refreshUsage(manual = false): Promise<void> {
   if (refreshInProgress) {
     return;
   }
@@ -653,6 +679,21 @@ async function refreshUsage(): Promise<void> {
   renderCurrent();
 
   try {
+    try {
+      const collected = await invoke<UsageSnapshot>("refresh_collected_usage_snapshot");
+      collectionError = collected.error;
+      if (manual && collected.error) {
+        settingsError = collected.error;
+      } else if (manual) {
+        settingsError = null;
+      }
+    } catch (error) {
+      collectionError = error instanceof Error ? error.message : String(error);
+      if (manual) {
+        settingsError = collectionError;
+      }
+    }
+
     latestSnapshot = await invoke<UsageSnapshot>("get_usage_snapshot");
   } catch (error) {
     latestSnapshot = errorSnapshot(error);

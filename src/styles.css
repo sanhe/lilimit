@@ -220,8 +220,10 @@ h2 {
   top: 34px;
   right: 8px;
   display: grid;
-  width: 204px;
+  width: 236px;
+  max-height: calc(100vh - 42px);
   gap: 10px;
+  overflow: auto;
   padding: 10px;
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -247,6 +249,10 @@ h2 {
   gap: 4px;
 }
 
+.segmented.three {
+  grid-template-columns: 1fr 1fr 1fr;
+}
+
 .segmented button {
   min-width: 0;
   height: 24px;
@@ -263,6 +269,21 @@ h2 {
   border-color: transparent;
   background: #0b84ff;
   color: #ffffff;
+}
+
+.settings-action {
+  height: 26px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--button-bg);
+  color: var(--text);
+  cursor: default;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.settings-action:hover {
+  background: var(--button-hover);
 }
 
 .settings-error {
