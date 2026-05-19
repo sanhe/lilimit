@@ -13,8 +13,8 @@ use serde_json::{json, Value};
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::TrayIconBuilder,
-    AppHandle, LogicalSize, Manager, PhysicalPosition, Position, Runtime, Size, WebviewWindow,
-    WindowEvent,
+    AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, Position, Runtime, Size,
+    WebviewWindow, WindowEvent,
 };
 use tauri_plugin_global_shortcut::ShortcutState;
 
@@ -295,8 +295,19 @@ fn save_widget_settings(
     if let Some(window) = app.get_webview_window("main") {
         apply_window_settings(&window, &next);
     }
+    let _ = app.emit_to("main", "settings-changed", &next);
+    let _ = app.emit_to("settings", "settings-changed", &next);
 
     Ok(next)
+}
+
+#[tauri::command]
+fn show_settings_window(app: AppHandle) -> Result<(), String> {
+    let window = app
+        .get_webview_window("settings")
+        .ok_or_else(|| "Settings window is unavailable.".to_string())?;
+    window.show().map_err(|error| error.to_string())?;
+    window.set_focus().map_err(|error| error.to_string())
 }
 
 fn persist_window_position(x: i32, y: i32) -> Result<(), String> {
@@ -1577,7 +1588,12 @@ fn main() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            if window.label() == "main" {
+            if window.label() == "settings" {
+                if let WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            } else if window.label() == "main" {
                 if let WindowEvent::Moved(position) = event {
                     // macOS and X11 usually report move events promptly. Some
                     // Wayland compositors may delay or limit programmatic
@@ -1591,7 +1607,8 @@ fn main() {
             refresh_collected_usage_snapshot,
             get_usage_snapshot,
             get_widget_settings,
-            save_widget_settings
+            save_widget_settings,
+            show_settings_window
         ])
         .run(tauri::generate_context!())
         .expect("failed to run lilimit");

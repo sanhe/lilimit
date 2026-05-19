@@ -21,6 +21,18 @@
         "alwaysOnTop": true,
         "transparent": false,
         "center": true
+      },
+      {
+        "label": "settings",
+        "title": "lilimit settings",
+        "width": 320,
+        "height": 300,
+        "decorations": true,
+        "resizable": false,
+        "alwaysOnTop": true,
+        "transparent": false,
+        "center": true,
+        "visible": false
       }
     ],
     "security": {

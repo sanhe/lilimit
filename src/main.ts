@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import "./styles.css";
 
@@ -83,6 +84,7 @@ const DEFAULT_SETTINGS: WidgetSettings = {
   windowPosition: null,
 };
 const currentWindow = getCurrentWindow();
+const isSettingsWindow = currentWindow.label === "settings";
 
 const app = document.querySelector<HTMLDivElement>("#app");
 
@@ -93,7 +95,6 @@ if (!app) {
 const appRoot = app;
 let currentSettings: WidgetSettings = DEFAULT_SETTINGS;
 let latestSnapshot: UsageSnapshot | null = null;
-let settingsOpen = false;
 let settingsError: string | null = null;
 let collectionError: string | null = null;
 let refreshInProgress = false;
@@ -345,10 +346,23 @@ function renderSettingsPanel(): string {
           <button type="button" data-keychain="allow" class="${keychainAccess === "allow" ? "active" : ""}">Allow</button>
         </div>
       </div>
-      <button class="settings-action refresh-button" type="button">Refresh now</button>
+      <button class="settings-action settings-refresh-button" type="button">Refresh now</button>
       ${settingsError ? `<p class="settings-error">${escapeHtml(settingsError)}</p>` : ""}
     </div>
   `;
+}
+
+function renderSettingsWindow(): void {
+  appRoot.innerHTML = `
+    <main class="surface settings-view ${currentSettings.background}-bg">
+      <header class="settings-header">
+        <h1>lilimit settings</h1>
+      </header>
+      ${renderSettingsPanel()}
+      <button class="settings-action close-settings-button" type="button">Done</button>
+    </main>
+  `;
+  bindInteractions();
 }
 
 function renderRefreshIcon(): string {
@@ -371,7 +385,6 @@ function renderTitlebar(stale = false): string {
         <button class="icon-button close-button" type="button" aria-label="Close lilimit" title="Close">x</button>
       </div>
     </header>
-    ${settingsOpen ? renderSettingsPanel() : ""}
   `;
 }
 
@@ -633,7 +646,7 @@ async function saveSettings(patch: Partial<WidgetSettings>): Promise<void> {
   const nextSettings = normalizeSettings({ ...currentSettings, ...patch });
   currentSettings = nextSettings;
   settingsError = null;
-  renderCurrent();
+  renderAfterSettingsChange();
 
   try {
     currentSettings = normalizeSettings(
@@ -643,7 +656,7 @@ async function saveSettings(patch: Partial<WidgetSettings>): Promise<void> {
     settingsError = error instanceof Error ? error.message : String(error);
   }
 
-  renderCurrent();
+  renderAfterSettingsChange();
 }
 
 function bindInteractions(): void {
@@ -652,8 +665,7 @@ function bindInteractions(): void {
   });
 
   appRoot.querySelector(".settings-button")?.addEventListener("click", () => {
-    settingsOpen = !settingsOpen;
-    renderCurrent();
+    void invoke("show_settings_window");
   });
 
   appRoot.querySelectorAll<HTMLButtonElement>("[data-display-mode]").forEach((button) => {
@@ -682,6 +694,32 @@ function bindInteractions(): void {
       void refreshUsage(true);
     });
   });
+
+  appRoot.querySelector(".settings-refresh-button")?.addEventListener("click", () => {
+    void refreshCollectedFromSettings();
+  });
+
+  appRoot.querySelector(".close-settings-button")?.addEventListener("click", () => {
+    void currentWindow.hide();
+  });
+}
+
+function renderAfterSettingsChange(): void {
+  if (isSettingsWindow) {
+    renderSettingsWindow();
+  } else {
+    renderCurrent();
+  }
+}
+
+async function refreshCollectedFromSettings(): Promise<void> {
+  try {
+    const collected = await invoke<UsageSnapshot>("refresh_collected_usage_snapshot");
+    settingsError = collected.error;
+  } catch (error) {
+    settingsError = error instanceof Error ? error.message : String(error);
+  }
+  renderSettingsWindow();
 }
 
 async function refreshUsage(manual = false): Promise<void> {
@@ -718,14 +756,23 @@ async function refreshUsage(manual = false): Promise<void> {
 }
 
 async function initialize(): Promise<void> {
-  renderLoading();
-
   try {
     currentSettings = normalizeSettings(await invoke<WidgetSettings>("get_widget_settings"));
   } catch {
     currentSettings = DEFAULT_SETTINGS;
   }
 
+  await listen<WidgetSettings>("settings-changed", (event) => {
+    currentSettings = normalizeSettings(event.payload);
+    renderAfterSettingsChange();
+  });
+
+  if (isSettingsWindow) {
+    renderSettingsWindow();
+    return;
+  }
+
+  renderLoading();
   await refreshUsage();
   window.setInterval(() => {
     void refreshUsage();
