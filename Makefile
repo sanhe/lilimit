@@ -1,4 +1,4 @@
-.PHONY: install dev tauri-dev typecheck rust-check rust-test secret-scan check build tauri-build clean
+.PHONY: install dev tauri-dev typecheck rust-check rust-build rust-test secret-scan check ci build tauri-build clean
 
 install:
 	pnpm install
@@ -12,10 +12,13 @@ typecheck:
 	pnpm typecheck
 
 rust-check:
-	cd src-tauri && cargo check
+	cd src-tauri && cargo check --locked
+
+rust-build:
+	cd src-tauri && cargo build --locked
 
 rust-test:
-	cd src-tauri && cargo test
+	cd src-tauri && cargo test --locked
 
 secret-scan:
 	@if ! command -v gitleaks >/dev/null 2>&1; then \
@@ -25,6 +28,8 @@ secret-scan:
 	gitleaks git --config .gitleaks.toml --redact .
 
 check: typecheck rust-check rust-test
+
+ci: build rust-check rust-build rust-test
 
 build:
 	pnpm build
