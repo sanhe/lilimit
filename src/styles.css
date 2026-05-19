@@ -489,11 +489,27 @@ h2 {
 
 footer {
   min-width: 0;
-  overflow: hidden;
+  gap: 6px;
   color: var(--subtle);
   font-size: 10.5px;
+  white-space: nowrap;
+}
+
+footer > span:first-child {
+  min-width: 0;
+  overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.collection-warning {
+  flex: 0 0 auto;
+  color: #c98921;
+  font-weight: 800;
+}
+
+.dark-bg .collection-warning {
+  color: #ffd38a;
 }
 
 .empty {

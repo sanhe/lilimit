@@ -229,6 +229,18 @@ function sourceLabel(source: UsageSource | null): string {
   }
 }
 
+function collectionWarning(): string {
+  if (!collectionError) {
+    return "";
+  }
+
+  const hasCodex = collectionError.includes("Codex:");
+  const hasClaude = collectionError.includes("Claude:");
+  const label = hasClaude && !hasCodex ? "Claude unavailable" : "Partial data";
+
+  return `<span class="collection-warning" title="${escapeHtml(collectionError)}">${escapeHtml(label)}</span>`;
+}
+
 function sortProviders(providers: ProviderUsage[]): ProviderUsage[] {
   const order = new Map([
     ["codex", 0],
@@ -554,7 +566,8 @@ function renderReady(snapshot: UsageSnapshot): string {
           }
         </div>
         <footer data-tauri-drag-region>
-          Updated ${formatUpdatedAt(snapshot.updatedAt)} / ${sourceLabel(snapshot.source)}
+          <span>Updated ${formatUpdatedAt(snapshot.updatedAt)} / ${sourceLabel(snapshot.source)}</span>
+          ${collectionWarning()}
         </footer>
       </main>
     `;
@@ -571,7 +584,8 @@ function renderReady(snapshot: UsageSnapshot): string {
         }
       </div>
       <footer data-tauri-drag-region>
-        Updated ${formatUpdatedAt(snapshot.updatedAt)} / ${sourceLabel(snapshot.source)}
+        <span>Updated ${formatUpdatedAt(snapshot.updatedAt)} / ${sourceLabel(snapshot.source)}</span>
+        ${collectionWarning()}
       </footer>
     </main>
   `;

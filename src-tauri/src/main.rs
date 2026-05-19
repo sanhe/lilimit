@@ -37,6 +37,8 @@ const CLAUDE_REFRESH_ENDPOINT: &str = "https://platform.claude.com/v1/oauth/toke
 const CLAUDE_OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 #[cfg(target_os = "macos")]
 const CLAUDE_KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
+#[cfg(target_os = "macos")]
+const CLAUDE_KEYCHAIN_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy)]
 enum SnapshotSource {
@@ -547,28 +549,60 @@ struct ClaudeOAuthUsageResponse {
     seven_day_opus: Option<ClaudeOAuthWindow>,
     #[serde(default)]
     seven_day_sonnet: Option<ClaudeOAuthWindow>,
-    #[serde(
-        default,
-        alias = "seven_day_claude_design",
-        alias = "claude_design",
-        alias = "design",
-        alias = "seven_day_omelette",
-        alias = "omelette",
-        alias = "omelette_promotional"
-    )]
+    #[serde(default)]
     seven_day_design: Option<ClaudeOAuthWindow>,
-    #[serde(
-        default,
-        alias = "seven_day_claude_routines",
-        alias = "claude_routines",
-        alias = "routines",
-        alias = "routine",
-        alias = "seven_day_cowork",
-        alias = "cowork"
-    )]
+    #[serde(default)]
+    seven_day_claude_design: Option<ClaudeOAuthWindow>,
+    #[serde(default)]
+    claude_design: Option<ClaudeOAuthWindow>,
+    #[serde(default)]
+    design: Option<ClaudeOAuthWindow>,
+    #[serde(default)]
+    seven_day_omelette: Option<ClaudeOAuthWindow>,
+    #[serde(default)]
+    omelette: Option<ClaudeOAuthWindow>,
+    #[serde(default)]
+    omelette_promotional: Option<ClaudeOAuthWindow>,
+    #[serde(default)]
     seven_day_routines: Option<ClaudeOAuthWindow>,
     #[serde(default)]
+    seven_day_claude_routines: Option<ClaudeOAuthWindow>,
+    #[serde(default)]
+    claude_routines: Option<ClaudeOAuthWindow>,
+    #[serde(default)]
+    routines: Option<ClaudeOAuthWindow>,
+    #[serde(default)]
+    routine: Option<ClaudeOAuthWindow>,
+    #[serde(default)]
+    seven_day_cowork: Option<ClaudeOAuthWindow>,
+    #[serde(default)]
+    cowork: Option<ClaudeOAuthWindow>,
+    #[serde(default)]
     extra_usage: Option<ClaudeExtraUsage>,
+}
+
+impl ClaudeOAuthUsageResponse {
+    fn design_window(&self) -> Option<&ClaudeOAuthWindow> {
+        self.seven_day_design
+            .as_ref()
+            .or(self.seven_day_claude_design.as_ref())
+            .or(self.claude_design.as_ref())
+            .or(self.design.as_ref())
+            .or(self.seven_day_omelette.as_ref())
+            .or(self.omelette.as_ref())
+            .or(self.omelette_promotional.as_ref())
+    }
+
+    fn routines_window(&self) -> Option<&ClaudeOAuthWindow> {
+        self.seven_day_routines
+            .as_ref()
+            .or(self.seven_day_claude_routines.as_ref())
+            .or(self.claude_routines.as_ref())
+            .or(self.routines.as_ref())
+            .or(self.routine.as_ref())
+            .or(self.seven_day_cowork.as_ref())
+            .or(self.cowork.as_ref())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -637,7 +671,9 @@ async fn refresh_collected_usage_snapshot() -> Result<UsageSnapshotResponse, Str
         SnapshotSource::LilimitCollected,
     );
     if !errors.is_empty() {
-        response.error = Some(errors.join(" / "));
+        let error_summary = errors.join(" / ");
+        eprintln!("lilimit collector warning: {error_summary}");
+        response.error = Some(error_summary);
     }
     Ok(response)
 }
@@ -1254,15 +1290,13 @@ fn claude_provider_from_usage(response: ClaudeOAuthUsageResponse) -> ProviderUsa
         usage_rows.push(usage_row_from_window("tertiary", "Model weekly", window));
     }
     if let Some(window) = response
-        .seven_day_design
-        .as_ref()
+        .design_window()
         .and_then(|window| rate_window_from_claude(window, Some(7.0 * 24.0 * 60.0)))
     {
         usage_rows.push(usage_row_from_window("claude-design", "Designs", &window));
     }
     if let Some(window) = response
-        .seven_day_routines
-        .as_ref()
+        .routines_window()
         .and_then(|window| rate_window_from_claude(window, Some(7.0 * 24.0 * 60.0)))
     {
         usage_rows.push(usage_row_from_window(
@@ -1428,7 +1462,9 @@ fn read_claude_credentials_from_keychain() -> Result<Option<String>, String> {
         .spawn()
         .map_err(|error| error.to_string())?;
     let mut stdout = child.stdout.take();
-    let deadline = Instant::now() + Duration::from_millis(1500);
+    // macOS may show a Keychain prompt for this subprocess. Give the user
+    // enough time to approve it instead of failing the background refresh.
+    let deadline = Instant::now() + CLAUDE_KEYCHAIN_READ_TIMEOUT;
 
     loop {
         if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
@@ -1599,7 +1635,8 @@ mod tests {
           "five_hour": { "utilization": 58, "resets_at": "2100-01-01T00:00:00Z" },
           "seven_day": { "utilization": 20, "resets_at": "2100-01-08T00:00:00Z" },
           "seven_day_sonnet": { "utilization": 27, "resets_at": "2100-01-08T00:00:00Z" },
-          "seven_day_design": { "utilization": 0, "resets_at": "2100-01-08T00:00:00Z" }
+          "seven_day_omelette": { "utilization": 0, "resets_at": "2100-01-08T00:00:00Z" },
+          "omelette_promotional": null
         }"#;
         let response: ClaudeOAuthUsageResponse = serde_json::from_str(json).unwrap();
         let provider = claude_provider_from_usage(response);
