@@ -8,6 +8,7 @@ type UsageSource = "lilimitCollected";
 type DisplayMode = "simple" | "full";
 type WidgetBackground = "dark" | "light";
 type KeychainAccess = "off" | "allow";
+type ToolbarDisplay = "text" | "bars";
 
 type WindowPosition = {
   x: number;
@@ -18,6 +19,7 @@ type WidgetSettings = {
   displayMode: DisplayMode;
   background: WidgetBackground;
   keychainAccess: KeychainAccess;
+  toolbarDisplay: ToolbarDisplay;
   windowPosition: WindowPosition | null;
 };
 
@@ -83,6 +85,7 @@ const DEFAULT_SETTINGS: WidgetSettings = {
   displayMode: "simple",
   background: "dark",
   keychainAccess: "off",
+  toolbarDisplay: "bars",
   windowPosition: null,
 };
 const currentWindow = getCurrentWindow();
@@ -305,6 +308,7 @@ function normalizeSettings(settings: Partial<WidgetSettings> | null): WidgetSett
     displayMode: settings?.displayMode === "full" ? "full" : "simple",
     background: settings?.background === "light" ? "light" : "dark",
     keychainAccess: settings?.keychainAccess === "allow" ? "allow" : "off",
+    toolbarDisplay: settings?.toolbarDisplay === "text" ? "text" : "bars",
     windowPosition: settings?.windowPosition ?? null,
   };
 }
@@ -337,6 +341,7 @@ function renderSettingsPanel(): string {
   const mode = currentSettings.displayMode;
   const background = currentSettings.background;
   const keychainAccess = currentSettings.keychainAccess;
+  const toolbarDisplay = currentSettings.toolbarDisplay;
 
   return `
     <div class="settings-panel">
@@ -359,6 +364,13 @@ function renderSettingsPanel(): string {
         <div class="segmented">
           <button type="button" data-keychain="off" class="${keychainAccess === "off" ? "active" : ""}">Off</button>
           <button type="button" data-keychain="allow" class="${keychainAccess === "allow" ? "active" : ""}">Allow</button>
+        </div>
+      </div>
+      <div class="setting-group">
+        <span>Toolbar</span>
+        <div class="segmented">
+          <button type="button" data-toolbar-display="bars" class="${toolbarDisplay === "bars" ? "active" : ""}">Bars</button>
+          <button type="button" data-toolbar-display="text" class="${toolbarDisplay === "text" ? "active" : ""}">Text</button>
         </div>
       </div>
       <button class="settings-action settings-refresh-button" type="button">Refresh now</button>
@@ -719,6 +731,14 @@ function bindInteractions(): void {
     button.addEventListener("click", () => {
       const keychainAccess: KeychainAccess = button.dataset.keychain === "allow" ? "allow" : "off";
       void saveSettings({ keychainAccess });
+    });
+  });
+
+  appRoot.querySelectorAll<HTMLButtonElement>("[data-toolbar-display]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const toolbarDisplay: ToolbarDisplay =
+        button.dataset.toolbarDisplay === "text" ? "text" : "bars";
+      void saveSettings({ toolbarDisplay });
     });
   });
 

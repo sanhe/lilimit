@@ -3,7 +3,7 @@ title = "lilimit gitleaks configuration"
 [extend]
 useDefault = true
 
-[allowlist]
+[[allowlists]]
 description = "Project-specific false positives"
 paths = [
   '''^node_modules/''',

@@ -11,6 +11,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{
+    image::Image,
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::TrayIconBuilder,
     AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, Position, Runtime, Size,
@@ -100,6 +101,17 @@ fn default_keychain_access() -> KeychainAccess {
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+enum ToolbarDisplay {
+    Text,
+    Bars,
+}
+
+fn default_toolbar_display() -> ToolbarDisplay {
+    ToolbarDisplay::Bars
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 struct WindowPosition {
     x: i32,
     y: i32,
@@ -114,6 +126,8 @@ struct WidgetSettings {
     background: WidgetBackground,
     #[serde(default = "default_keychain_access")]
     keychain_access: KeychainAccess,
+    #[serde(default = "default_toolbar_display")]
+    toolbar_display: ToolbarDisplay,
     #[serde(default)]
     window_position: Option<WindowPosition>,
 }
@@ -124,6 +138,7 @@ impl Default for WidgetSettings {
             display_mode: DisplayMode::Simple,
             background: WidgetBackground::Dark,
             keychain_access: KeychainAccess::Off,
+            toolbar_display: ToolbarDisplay::Bars,
             window_position: None,
         }
     }
@@ -352,6 +367,7 @@ fn save_widget_settings(
     }
     let _ = app.emit_to("main", "settings-changed", &next);
     let _ = app.emit_to("settings", "settings-changed", &next);
+    sync_tray_title_from_current_snapshot(&app);
 
     Ok(next)
 }
@@ -1816,26 +1832,44 @@ fn toggle_main_window(app: &tauri::AppHandle) {
 }
 
 fn sync_tray_title_from_response(app: &AppHandle, response: &UsageSnapshotResponse) {
+    let settings = read_widget_settings().unwrap_or_default();
     if response.status == "ready" {
-        set_tray_usage_title(app, tray_usage_title(&response.providers));
+        set_tray_usage(app, &settings, Some(&response.providers));
     } else {
-        set_tray_usage_title(app, None);
+        set_tray_usage(app, &settings, None);
     }
 }
 
 fn sync_tray_title_from_current_snapshot(app: &AppHandle) {
+    let settings = read_widget_settings().unwrap_or_default();
     let Ok(candidate) = usage_snapshot_candidate() else {
-        set_tray_usage_title(app, None);
+        set_tray_usage(app, &settings, None);
         return;
     };
     let path_text = candidate.path.to_string_lossy().into_owned();
     let Ok(contents) = fs::read_to_string(&candidate.path) else {
-        set_tray_usage_title(app, None);
+        set_tray_usage(app, &settings, None);
         return;
     };
 
     let response = parse_lilimit_snapshot(&contents, &path_text, candidate.source);
     sync_tray_title_from_response(app, &response);
+}
+
+fn set_tray_usage(app: &AppHandle, settings: &WidgetSettings, providers: Option<&[ProviderUsage]>) {
+    match settings.toolbar_display {
+        ToolbarDisplay::Text => set_tray_usage_title(app, providers.and_then(tray_usage_title)),
+        ToolbarDisplay::Bars => {
+            if let Some(providers) = providers {
+                if let Some(icon) = tray_usage_bar_icon(providers) {
+                    set_tray_usage_icon(app, icon, tray_usage_title(providers));
+                    return;
+                }
+            }
+
+            set_tray_usage_title(app, None);
+        }
+    }
 }
 
 fn tray_usage_title(providers: &[ProviderUsage]) -> Option<String> {
@@ -1871,6 +1905,118 @@ fn tray_provider_label(name: &str) -> &str {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct TrayUsageMetric {
+    used_percent: f64,
+    color: [u8; 4],
+}
+
+fn tray_usage_metrics(providers: &[ProviderUsage]) -> Vec<TrayUsageMetric> {
+    providers
+        .iter()
+        .filter_map(|provider| {
+            provider_tray_used_percent(provider).map(|used_percent| TrayUsageMetric {
+                used_percent,
+                color: tray_provider_bar_color(&provider.name, provider.stale),
+            })
+        })
+        .take(2)
+        .collect()
+}
+
+fn tray_provider_bar_color(name: &str, stale: bool) -> [u8; 4] {
+    let mut color = match name {
+        "Codex" => [90, 213, 140, 255],
+        "Claude" => [214, 126, 91, 255],
+        _ => [130, 170, 210, 255],
+    };
+    if stale {
+        color[3] = 150;
+    }
+    color
+}
+
+fn tray_usage_bar_icon(providers: &[ProviderUsage]) -> Option<Image<'static>> {
+    let metrics = tray_usage_metrics(providers);
+    (!metrics.is_empty()).then(|| render_tray_usage_bar_icon(&metrics))
+}
+
+fn render_tray_usage_bar_icon(metrics: &[TrayUsageMetric]) -> Image<'static> {
+    const WIDTH: u32 = 52;
+    const HEIGHT: u32 = 22;
+    const TRACK_X: u32 = 4;
+    const TRACK_WIDTH: u32 = 44;
+
+    let mut rgba = vec![0_u8; (WIDTH * HEIGHT * 4) as usize];
+    let rows: &[(u32, u32)] = if metrics.len() == 1 {
+        &[(8, 6)]
+    } else {
+        &[(5, 5), (13, 5)]
+    };
+
+    for (metric, (y, height)) in metrics.iter().zip(rows.iter().copied()) {
+        fill_rect(
+            &mut rgba,
+            WIDTH,
+            TRACK_X,
+            y,
+            TRACK_WIDTH,
+            height,
+            [96, 96, 96, 110],
+        );
+        let fill_width = ((TRACK_WIDTH as f64) * (metric.used_percent / 100.0)).round() as u32;
+        let fill_width = if metric.used_percent > 0.0 {
+            fill_width.max(1)
+        } else {
+            0
+        };
+        fill_rect(
+            &mut rgba,
+            WIDTH,
+            TRACK_X,
+            y,
+            fill_width.min(TRACK_WIDTH),
+            height,
+            metric.color,
+        );
+    }
+
+    Image::new_owned(rgba, WIDTH, HEIGHT)
+}
+
+fn fill_rect(
+    rgba: &mut [u8],
+    image_width: u32,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    color: [u8; 4],
+) {
+    for yy in y..y.saturating_add(height) {
+        for xx in x..x.saturating_add(width) {
+            let index = ((yy * image_width + xx) * 4) as usize;
+            if index + 3 < rgba.len() {
+                rgba[index..index + 4].copy_from_slice(&color);
+            }
+        }
+    }
+}
+
+fn set_tray_usage_icon(app: &AppHandle, icon: Image<'static>, title: Option<String>) {
+    let Some(tray) = app.tray_by_id(TRAY_ID) else {
+        return;
+    };
+
+    let _ = tray.set_title(None::<&str>);
+    let _ = tray.set_tooltip(Some(
+        title
+            .map(|value| format!("lilimit - {value}"))
+            .unwrap_or_else(|| "lilimit".to_string()),
+    ));
+    let _ = tray.set_icon_with_as_template(Some(icon), false);
+}
+
 fn set_tray_usage_title(app: &AppHandle, title: Option<String>) {
     let Some(tray) = app.tray_by_id(TRAY_ID) else {
         return;
@@ -1889,18 +2035,22 @@ fn set_tray_usage_title(app: &AppHandle, title: Option<String>) {
             {
                 let _ = tray.set_icon(None);
             }
-        }
-        None => {
-            let _ = tray.set_title(None::<&str>);
-            let _ = tray.set_tooltip(Some("lilimit"));
-
-            #[cfg(target_os = "macos")]
+            #[cfg(not(target_os = "macos"))]
             {
                 let _ = tray.set_icon_with_as_template(
                     Some(tauri::include_image!("./icons/tray-template.png")),
                     true,
                 );
             }
+        }
+        None => {
+            let _ = tray.set_title(None::<&str>);
+            let _ = tray.set_tooltip(Some("lilimit"));
+
+            let _ = tray.set_icon_with_as_template(
+                Some(tauri::include_image!("./icons/tray-template.png")),
+                true,
+            );
         }
     }
 }
@@ -2091,5 +2241,57 @@ mod tests {
             tray_usage_title(&providers),
             Some("Codex 29%  Claude 58%".to_string())
         );
+    }
+
+    #[test]
+    fn builds_tray_usage_bar_metrics_from_used_session_percent() {
+        let providers = vec![
+            ProviderUsage {
+                name: "Codex".to_string(),
+                session_left_percent: Some(71.0),
+                weekly_left_percent: None,
+                reset_text: String::new(),
+                updated_at: None,
+                usage_rows: Vec::new(),
+                primary: None,
+                secondary: None,
+                tertiary: None,
+                credits_remaining: None,
+                code_review_remaining_percent: None,
+                token_usage: None,
+                daily_usage: Vec::new(),
+                stale: false,
+                error: None,
+            },
+            ProviderUsage {
+                name: "Claude".to_string(),
+                session_left_percent: Some(42.0),
+                weekly_left_percent: None,
+                reset_text: String::new(),
+                updated_at: None,
+                usage_rows: Vec::new(),
+                primary: Some(RateWindowDetail {
+                    used_percent: Some(58.0),
+                    percent_left: Some(42.0),
+                    window_minutes: None,
+                    resets_at: None,
+                    reset_description: None,
+                }),
+                secondary: None,
+                tertiary: None,
+                credits_remaining: None,
+                code_review_remaining_percent: None,
+                token_usage: None,
+                daily_usage: Vec::new(),
+                stale: false,
+                error: None,
+            },
+        ];
+
+        let metrics = tray_usage_metrics(&providers);
+
+        assert_eq!(metrics.len(), 2);
+        assert_eq!(metrics[0].used_percent, 29.0);
+        assert_eq!(metrics[1].used_percent, 58.0);
     }
 }

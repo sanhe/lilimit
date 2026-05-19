@@ -22,7 +22,7 @@ secret-scan:
 		echo "gitleaks is not installed. Install it from https://github.com/gitleaks/gitleaks."; \
 		exit 127; \
 	fi
-	gitleaks detect --source . --config .gitleaks.toml --redact
+	gitleaks git --config .gitleaks.toml --redact .
 
 check: typecheck rust-check rust-test
 
