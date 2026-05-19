@@ -92,6 +92,7 @@ let currentSettings: WidgetSettings = DEFAULT_SETTINGS;
 let latestSnapshot: UsageSnapshot | null = null;
 let settingsOpen = false;
 let settingsError: string | null = null;
+let refreshInProgress = false;
 
 function clampPercent(value: number | null): number | null {
   if (value === null || !Number.isFinite(value)) {
@@ -326,12 +327,22 @@ function renderSettingsPanel(): string {
   `;
 }
 
+function renderRefreshIcon(): string {
+  return `
+    <svg class="refresh-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path d="M21 12a9 9 0 1 1-2.64-6.36"></path>
+      <path d="M21 3v6h-6"></path>
+    </svg>
+  `;
+}
+
 function renderTitlebar(stale = false): string {
   return `
     <header class="titlebar" data-tauri-drag-region>
       <h1 data-tauri-drag-region>lilimit</h1>
       <div class="title-actions">
         ${stale ? '<span class="stale">stale</span>' : ""}
+        <button class="icon-button refresh-button${refreshInProgress ? " refreshing" : ""}" type="button" aria-label="Refresh usage data" title="Refresh" ${refreshInProgress ? "disabled" : ""}>${renderRefreshIcon()}</button>
         <button class="icon-button settings-button" type="button" aria-label="Widget settings" title="Settings">...</button>
         <button class="icon-button close-button" type="button" aria-label="Close lilimit" title="Close">x</button>
       </div>
@@ -575,8 +586,8 @@ function renderCurrent(): void {
   }
 }
 
-function renderAppError(error: unknown): void {
-  renderApp({
+function errorSnapshot(error: unknown): UsageSnapshot {
+  return {
     status: "ioError",
     path: "",
     source: null,
@@ -584,7 +595,7 @@ function renderAppError(error: unknown): void {
     showsUsedPercent: false,
     providers: [],
     error: error instanceof Error ? error.message : String(error),
-  });
+  };
 }
 
 async function saveSettings(patch: Partial<WidgetSettings>): Promise<void> {
@@ -614,6 +625,10 @@ function bindInteractions(): void {
     renderCurrent();
   });
 
+  appRoot.querySelector(".refresh-button")?.addEventListener("click", () => {
+    void refreshUsage();
+  });
+
   appRoot.querySelectorAll<HTMLButtonElement>("[data-display-mode]").forEach((button) => {
     button.addEventListener("click", () => {
       const displayMode = button.dataset.displayMode === "full" ? "full" : "simple";
@@ -630,11 +645,20 @@ function bindInteractions(): void {
 }
 
 async function refreshUsage(): Promise<void> {
+  if (refreshInProgress) {
+    return;
+  }
+
+  refreshInProgress = true;
+  renderCurrent();
+
   try {
-    const snapshot = await invoke<UsageSnapshot>("get_usage_snapshot");
-    renderApp(snapshot);
+    latestSnapshot = await invoke<UsageSnapshot>("get_usage_snapshot");
   } catch (error) {
-    renderAppError(error);
+    latestSnapshot = errorSnapshot(error);
+  } finally {
+    refreshInProgress = false;
+    renderCurrent();
   }
 }
 
