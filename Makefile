@@ -1,4 +1,4 @@
-.PHONY: install dev tauri-dev typecheck rust-check rust-build rust-test secret-scan check ci build tauri-build clean
+.PHONY: install dev tauri-dev typecheck rust-check rust-build rust-test secret-scan check ci analyze build tauri-build clean
 
 install:
 	pnpm install
@@ -30,6 +30,8 @@ secret-scan:
 check: typecheck rust-check rust-test
 
 ci: build rust-check rust-build rust-test
+
+analyze: ci secret-scan
 
 build:
 	pnpm build
