@@ -21,6 +21,7 @@ use tauri_plugin_global_shortcut::ShortcutState;
 const SHOW_WIDGET_ID: &str = "show_widget";
 const HIDE_WIDGET_ID: &str = "hide_widget";
 const QUIT_ID: &str = "quit";
+const TRAY_ID: &str = "lilimit";
 const TOGGLE_SHORTCUT: &str = "CommandOrControl+Shift+L";
 const SETTINGS_FILE: &str = "settings.json";
 const COLLECTED_USAGE_FILE: &str = "collected_snapshot.json";
@@ -337,11 +338,11 @@ fn apply_window_settings<R: Runtime>(window: &WebviewWindow<R>, settings: &Widge
 }
 
 #[tauri::command]
-fn get_usage_snapshot() -> UsageSnapshotResponse {
+fn get_usage_snapshot(app: AppHandle) -> UsageSnapshotResponse {
     let candidate = match usage_snapshot_candidate() {
         Ok(candidate) => candidate,
         Err(error) => {
-            return UsageSnapshotResponse {
+            let response = UsageSnapshotResponse {
                 status: "ioError".to_string(),
                 path: String::new(),
                 source: None,
@@ -349,7 +350,9 @@ fn get_usage_snapshot() -> UsageSnapshotResponse {
                 shows_used_percent: false,
                 providers: Vec::new(),
                 error: Some(error),
-            }
+            };
+            sync_tray_title_from_response(&app, &response);
+            return response;
         }
     };
 
@@ -357,7 +360,7 @@ fn get_usage_snapshot() -> UsageSnapshotResponse {
     let contents = match fs::read_to_string(&candidate.path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return UsageSnapshotResponse {
+            let response = UsageSnapshotResponse {
                 status: "missing".to_string(),
                 path: path_text,
                 source: None,
@@ -365,10 +368,12 @@ fn get_usage_snapshot() -> UsageSnapshotResponse {
                 shows_used_percent: false,
                 providers: Vec::new(),
                 error: None,
-            }
+            };
+            sync_tray_title_from_response(&app, &response);
+            return response;
         }
         Err(error) => {
-            return UsageSnapshotResponse {
+            let response = UsageSnapshotResponse {
                 status: "ioError".to_string(),
                 path: path_text,
                 source: Some(candidate.source.as_str().to_string()),
@@ -376,11 +381,15 @@ fn get_usage_snapshot() -> UsageSnapshotResponse {
                 shows_used_percent: false,
                 providers: Vec::new(),
                 error: Some(error.to_string()),
-            }
+            };
+            sync_tray_title_from_response(&app, &response);
+            return response;
         }
     };
 
-    parse_lilimit_snapshot(&contents, &path_text, candidate.source)
+    let response = parse_lilimit_snapshot(&contents, &path_text, candidate.source);
+    sync_tray_title_from_response(&app, &response);
+    response
 }
 
 fn parse_lilimit_snapshot(
@@ -639,7 +648,7 @@ struct ClaudeExtraUsage {
 }
 
 #[tauri::command]
-async fn refresh_collected_usage_snapshot() -> Result<UsageSnapshotResponse, String> {
+async fn refresh_collected_usage_snapshot(app: AppHandle) -> Result<UsageSnapshotResponse, String> {
     let settings = read_widget_settings().unwrap_or_default();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -681,6 +690,7 @@ async fn refresh_collected_usage_snapshot() -> Result<UsageSnapshotResponse, Str
         &path.to_string_lossy(),
         SnapshotSource::LilimitCollected,
     );
+    sync_tray_title_from_response(&app, &response);
     if !errors.is_empty() {
         let error_summary = errors.join(" / ");
         eprintln!("lilimit collector warning: {error_summary}");
@@ -1533,6 +1543,96 @@ fn toggle_main_window(app: &tauri::AppHandle) {
     }
 }
 
+fn sync_tray_title_from_response(app: &AppHandle, response: &UsageSnapshotResponse) {
+    if response.status == "ready" {
+        set_tray_usage_title(app, tray_usage_title(&response.providers));
+    } else {
+        set_tray_usage_title(app, None);
+    }
+}
+
+fn sync_tray_title_from_current_snapshot(app: &AppHandle) {
+    let Ok(candidate) = usage_snapshot_candidate() else {
+        set_tray_usage_title(app, None);
+        return;
+    };
+    let path_text = candidate.path.to_string_lossy().into_owned();
+    let Ok(contents) = fs::read_to_string(&candidate.path) else {
+        set_tray_usage_title(app, None);
+        return;
+    };
+
+    let response = parse_lilimit_snapshot(&contents, &path_text, candidate.source);
+    sync_tray_title_from_response(app, &response);
+}
+
+fn tray_usage_title(providers: &[ProviderUsage]) -> Option<String> {
+    let parts = providers
+        .iter()
+        .filter_map(|provider| {
+            let used_percent = provider_tray_used_percent(provider)?;
+            Some(format!(
+                "{} {}%",
+                tray_provider_label(&provider.name),
+                used_percent.round() as i64
+            ))
+        })
+        .collect::<Vec<_>>();
+
+    (!parts.is_empty()).then(|| parts.join("  "))
+}
+
+fn provider_tray_used_percent(provider: &ProviderUsage) -> Option<f64> {
+    provider
+        .primary
+        .as_ref()
+        .and_then(|window| window.used_percent)
+        .or_else(|| provider.session_left_percent.map(|left| 100.0 - left))
+        .map(clamp_percent)
+}
+
+fn tray_provider_label(name: &str) -> &str {
+    match name {
+        "Codex" => "Codex",
+        "Claude" => "Claude",
+        _ => name,
+    }
+}
+
+fn set_tray_usage_title(app: &AppHandle, title: Option<String>) {
+    let Some(tray) = app.tray_by_id(TRAY_ID) else {
+        return;
+    };
+
+    match title {
+        Some(title) => {
+            let _ = tray.set_title(Some(title.as_str()));
+            let _ = tray.set_tooltip(Some(format!("lilimit - {title}")));
+
+            // macOS can render a status item as text-only, which makes the
+            // usage numbers visible in the menu bar instead of the lilimit
+            // icon. Linux panels generally need the icon, and GNOME Wayland
+            // may still hide the title depending on AppIndicator support.
+            #[cfg(target_os = "macos")]
+            {
+                let _ = tray.set_icon(None);
+            }
+        }
+        None => {
+            let _ = tray.set_title(None::<&str>);
+            let _ = tray.set_tooltip(Some("lilimit"));
+
+            #[cfg(target_os = "macos")]
+            {
+                let _ = tray.set_icon_with_as_template(
+                    Some(tauri::include_image!("./icons/tray-template.png")),
+                    true,
+                );
+            }
+        }
+    }
+}
+
 fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, SHOW_WIDGET_ID, "Show Widget", true, None::<&str>)?;
     let hide = MenuItem::with_id(app, HIDE_WIDGET_ID, "Hide Widget", true, None::<&str>)?;
@@ -1540,10 +1640,10 @@ fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
     let quit = MenuItem::with_id(app, QUIT_ID, "Quit lilimit", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show, &hide, &separator, &quit])?;
 
-    // macOS shows this as a menu-bar status item. GNOME support depends on the
+    // macOS can show a text status item. GNOME support depends on the
     // shell/session: X11 and AppIndicator-capable setups are more predictable
-    // than stock GNOME Wayland.
-    TrayIconBuilder::with_id("lilimit")
+    // than stock GNOME Wayland, and tray titles may not be displayed there.
+    TrayIconBuilder::with_id(TRAY_ID)
         .icon(tauri::include_image!("./icons/tray-template.png"))
         .icon_as_template(true)
         .tooltip("lilimit")
@@ -1559,6 +1659,8 @@ fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
             }
         })
         .build(app)?;
+
+    sync_tray_title_from_current_snapshot(app.handle());
 
     Ok(())
 }
@@ -1666,5 +1768,52 @@ mod tests {
             .usage_rows
             .iter()
             .any(|row| row.id == "claude-design" && row.percent_left == Some(100.0)));
+    }
+
+    #[test]
+    fn builds_tray_usage_title_from_used_session_percent() {
+        let providers = vec![
+            ProviderUsage {
+                name: "Codex".to_string(),
+                session_left_percent: Some(71.0),
+                weekly_left_percent: None,
+                reset_text: String::new(),
+                updated_at: None,
+                usage_rows: Vec::new(),
+                primary: None,
+                secondary: None,
+                tertiary: None,
+                credits_remaining: None,
+                code_review_remaining_percent: None,
+                token_usage: None,
+                daily_usage: Vec::new(),
+            },
+            ProviderUsage {
+                name: "Claude".to_string(),
+                session_left_percent: Some(42.0),
+                weekly_left_percent: None,
+                reset_text: String::new(),
+                updated_at: None,
+                usage_rows: Vec::new(),
+                primary: Some(RateWindowDetail {
+                    used_percent: Some(58.0),
+                    percent_left: Some(42.0),
+                    window_minutes: None,
+                    resets_at: None,
+                    reset_description: None,
+                }),
+                secondary: None,
+                tertiary: None,
+                credits_remaining: None,
+                code_review_remaining_percent: None,
+                token_usage: None,
+                daily_usage: Vec::new(),
+            },
+        ];
+
+        assert_eq!(
+            tray_usage_title(&providers),
+            Some("Codex 29%  Claude 58%".to_string())
+        );
     }
 }
