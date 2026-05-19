@@ -63,6 +63,8 @@ type ProviderUsage = {
   codeReviewRemainingPercent: number | null;
   tokenUsage: TokenUsageSummary | null;
   dailyUsage: DailyUsagePoint[];
+  stale: boolean;
+  error: string | null;
 };
 
 type UsageSnapshot = {
@@ -75,7 +77,7 @@ type UsageSnapshot = {
   error: string | null;
 };
 
-const REFRESH_MS = 30_000;
+const REFRESH_MS = 5 * 60 * 1000;
 const STALE_MS = 15 * 60 * 1000;
 const DEFAULT_SETTINGS: WidgetSettings = {
   displayMode: "simple",
@@ -231,15 +233,28 @@ function sourceLabel(source: UsageSource | null): string {
 }
 
 function collectionWarning(): string {
-  if (!collectionError) {
+  const providerErrors =
+    latestSnapshot?.status === "ready"
+      ? latestSnapshot.providers
+          .filter((provider) => provider.error)
+          .map((provider) => `${provider.name}: ${provider.error}`)
+      : [];
+  const warning = collectionError || providerErrors.join(" / ");
+
+  if (!warning) {
     return "";
   }
 
-  const hasCodex = collectionError.includes("Codex:");
-  const hasClaude = collectionError.includes("Claude:");
-  const label = hasClaude && !hasCodex ? "Claude unavailable" : "Partial data";
+  const hasCodex = warning.includes("Codex:");
+  const hasClaude = warning.includes("Claude:");
+  const label =
+    hasClaude && !hasCodex
+      ? providerErrors.length > 0 && !collectionError
+        ? "Claude stale"
+        : "Claude unavailable"
+      : "Partial data";
 
-  return `<span class="collection-warning" title="${escapeHtml(collectionError)}">${escapeHtml(label)}</span>`;
+  return `<span class="collection-warning" title="${escapeHtml(warning)}">${escapeHtml(label)}</span>`;
 }
 
 function sortProviders(providers: ProviderUsage[]): ProviderUsage[] {
@@ -391,23 +406,36 @@ function renderTitlebar(stale = false): string {
 function renderSimpleProvider(provider: ProviderUsage): string {
   const session = clampPercent(provider.sessionLeftPercent);
   const weekly = clampPercent(provider.weeklyLeftPercent);
-  const tone = session === null ? "unknown" : providerTone(session);
+  const sessionTone = session === null ? "unknown" : providerTone(session);
+  const weeklyTone = weekly === null ? "unknown" : providerTone(weekly);
   const name = escapeHtml(provider.name);
   const resetText = escapeHtml(provider.resetText || "reset n/a");
-  const width = session ?? 0;
+  const sessionWidth = session ?? 0;
+  const weeklyWidth = weekly ?? 0;
+  const providerIsStale = provider.stale || isStale(provider.updatedAt);
+  const stateTitle = provider.error ? ` title="${escapeHtml(provider.error)}"` : "";
+  const stateBadge = providerIsStale
+    ? `<span class="provider-state"${stateTitle}>stale</span>`
+    : "";
 
   return `
-    <section class="provider" aria-label="${name} usage">
+    <section class="provider${providerIsStale ? " stale-provider" : ""}" aria-label="${name} usage"${stateTitle}>
       <div class="provider-line">
         <strong>${name}</strong>
         <span class="numbers">
           <span>${formatPercent(session)} session</span>
           <span>${formatPercent(weekly)} week</span>
           <span>${resetText}</span>
+          ${stateBadge}
         </span>
       </div>
-      <div class="meter" aria-label="${name} session left">
-        <div class="meter-fill ${tone}" style="width: ${width}%"></div>
+      <div class="simple-meters">
+        <div class="meter" aria-label="${name} session left">
+          <div class="meter-fill ${sessionTone}" style="width: ${sessionWidth}%"></div>
+        </div>
+        <div class="meter week-meter" aria-label="${name} weekly left">
+          <div class="meter-fill ${weeklyTone}" style="width: ${weeklyWidth}%"></div>
+        </div>
       </div>
     </section>
   `;
@@ -485,6 +513,11 @@ function renderFullProvider(provider: ProviderUsage, showsUsedPercent: boolean):
   const rows = provider.usageRows.length > 0 ? provider.usageRows : fallbackRows(provider);
   const name = escapeHtml(provider.name);
   const updatedAt = provider.updatedAt ?? latestSnapshot?.updatedAt ?? null;
+  const providerIsStale = provider.stale || isStale(updatedAt);
+  const stateTitle = provider.error ? ` title="${escapeHtml(provider.error)}"` : "";
+  const stateBadge = providerIsStale
+    ? `<span class="provider-state"${stateTitle}>stale</span>`
+    : "";
   const usageRows = [
     ...rows.map((row) => renderFullUsageRow(row, color, showsUsedPercent)),
     provider.codeReviewRemainingPercent !== null
@@ -502,11 +535,11 @@ function renderFullProvider(provider: ProviderUsage, showsUsedPercent: boolean):
   ].join("");
 
   return `
-    <section class="full-provider" style="--provider-color: ${color}">
+    <section class="full-provider${providerIsStale ? " stale-provider" : ""}" style="--provider-color: ${color}"${stateTitle}>
       <div class="full-provider-header">
         <div>
           <h2>${name}</h2>
-          <span>Updated ${formatAge(updatedAt)}</span>
+          <span>Updated ${formatAge(updatedAt)} ${stateBadge}</span>
         </div>
         ${
           provider.creditsRemaining !== null
@@ -714,7 +747,9 @@ function renderAfterSettingsChange(): void {
 
 async function refreshCollectedFromSettings(): Promise<void> {
   try {
-    const collected = await invoke<UsageSnapshot>("refresh_collected_usage_snapshot");
+    const collected = await invoke<UsageSnapshot>("refresh_collected_usage_snapshot", {
+      force: true,
+    });
     settingsError = collected.error;
   } catch (error) {
     settingsError = error instanceof Error ? error.message : String(error);
@@ -732,7 +767,9 @@ async function refreshUsage(manual = false): Promise<void> {
 
   try {
     try {
-      const collected = await invoke<UsageSnapshot>("refresh_collected_usage_snapshot");
+      const collected = await invoke<UsageSnapshot>("refresh_collected_usage_snapshot", {
+        force: manual,
+      });
       collectionError = collected.error;
       if (manual && collected.error) {
         settingsError = collected.error;

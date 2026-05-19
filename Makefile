@@ -1,4 +1,4 @@
-.PHONY: install dev tauri-dev typecheck rust-check rust-test check build tauri-build clean
+.PHONY: install dev tauri-dev typecheck rust-check rust-test secret-scan check build tauri-build clean
 
 install:
 	pnpm install
@@ -16,6 +16,13 @@ rust-check:
 
 rust-test:
 	cd src-tauri && cargo test
+
+secret-scan:
+	@if ! command -v gitleaks >/dev/null 2>&1; then \
+		echo "gitleaks is not installed. Install it from https://github.com/gitleaks/gitleaks."; \
+		exit 127; \
+	fi
+	gitleaks detect --source . --config .gitleaks.toml --redact
 
 check: typecheck rust-check rust-test
 

@@ -305,6 +305,10 @@ h2 {
   min-width: 0;
 }
 
+.stale-provider {
+  opacity: 0.82;
+}
+
 .provider-line {
   display: flex;
   align-items: baseline;
@@ -335,11 +339,26 @@ h2 {
   white-space: nowrap;
 }
 
+.provider-state {
+  color: #d38a1f;
+  font-weight: 800;
+}
+
+.simple-meters {
+  display: grid;
+  gap: 3px;
+}
+
 .meter {
   height: 5px;
   overflow: hidden;
   border-radius: 999px;
   background: var(--meter-bg);
+}
+
+.week-meter {
+  height: 3px;
+  opacity: 0.78;
 }
 
 .meter-fill {

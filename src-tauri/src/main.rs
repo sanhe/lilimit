@@ -25,10 +25,15 @@ const TRAY_ID: &str = "lilimit";
 const TOGGLE_SHORTCUT: &str = "CommandOrControl+Shift+L";
 const SETTINGS_FILE: &str = "settings.json";
 const COLLECTED_USAGE_FILE: &str = "collected_snapshot.json";
+const COLLECTOR_STATE_FILE: &str = "collector_state.json";
 const SIMPLE_WIDTH: f64 = 280.0;
 const SIMPLE_HEIGHT: f64 = 140.0;
 const FULL_WIDTH: f64 = 360.0;
 const FULL_HEIGHT: f64 = 560.0;
+const COLLECTION_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const CLAUDE_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const CLAUDE_RATE_LIMIT_BASE_BACKOFF: Duration = Duration::from_secs(5 * 60);
+const CLAUDE_RATE_LIMIT_MAX_BACKOFF: Duration = Duration::from_secs(6 * 60 * 60);
 const CODEX_AUTH_REFRESH_AFTER_DAYS: i64 = 8;
 const CODEX_REFRESH_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
 const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -196,13 +201,26 @@ struct ProviderUsage {
     token_usage: Option<TokenUsageSummary>,
     #[serde(default)]
     daily_usage: Vec<DailyUsagePoint>,
+    #[serde(default)]
+    stale: bool,
+    #[serde(default)]
+    error: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct UsageSnapshotFile {
     updated_at: String,
     providers: Vec<ProviderUsage>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CollectorState {
+    #[serde(default)]
+    claude_next_attempt_at: Option<String>,
+    #[serde(default)]
+    claude_rate_limit_failures: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -272,6 +290,42 @@ fn write_widget_settings(settings: &WidgetSettings) -> Result<(), String> {
 
     let contents = serde_json::to_string_pretty(settings).map_err(|error| error.to_string())?;
     fs::write(path, contents).map_err(|error| error.to_string())
+}
+
+fn collector_state_path() -> Result<PathBuf, String> {
+    Ok(lilimit_config_dir()?.join(COLLECTOR_STATE_FILE))
+}
+
+fn read_collector_state() -> CollectorState {
+    let Ok(path) = collector_state_path() else {
+        return CollectorState::default();
+    };
+    let Ok(contents) = fs::read_to_string(&path) else {
+        return CollectorState::default();
+    };
+
+    serde_json::from_str::<CollectorState>(&contents).unwrap_or_default()
+}
+
+fn write_collector_state(state: &CollectorState) -> Result<(), String> {
+    let path = collector_state_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+
+    let contents = serde_json::to_string_pretty(state).map_err(|error| error.to_string())?;
+    fs::write(path, contents).map_err(|error| error.to_string())
+}
+
+fn read_collected_usage_snapshot_file() -> Result<Option<UsageSnapshotFile>, String> {
+    let path = collected_usage_snapshot_path()?;
+    match fs::read_to_string(&path) {
+        Ok(contents) => serde_json::from_str::<UsageSnapshotFile>(&contents)
+            .map(Some)
+            .map_err(|error| error.to_string()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 #[tauri::command]
@@ -488,6 +542,7 @@ where
 #[derive(Debug)]
 enum UsageFetchError {
     Unauthorized,
+    RateLimited(Option<DateTime<Utc>>),
     Message(String),
 }
 
@@ -495,6 +550,12 @@ impl std::fmt::Display for UsageFetchError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             UsageFetchError::Unauthorized => write!(formatter, "unauthorized"),
+            UsageFetchError::RateLimited(Some(retry_at)) => write!(
+                formatter,
+                "rate limited; retry {}",
+                reset_countdown_description(*retry_at)
+            ),
+            UsageFetchError::RateLimited(None) => write!(formatter, "rate limited"),
             UsageFetchError::Message(message) => write!(formatter, "{message}"),
         }
     }
@@ -648,8 +709,23 @@ struct ClaudeExtraUsage {
 }
 
 #[tauri::command]
-async fn refresh_collected_usage_snapshot(app: AppHandle) -> Result<UsageSnapshotResponse, String> {
+async fn refresh_collected_usage_snapshot(
+    app: AppHandle,
+    force: Option<bool>,
+) -> Result<UsageSnapshotResponse, String> {
+    let force = force.unwrap_or(false);
     let settings = read_widget_settings().unwrap_or_default();
+    let previous_snapshot = read_collected_usage_snapshot_file().unwrap_or(None);
+    if !force {
+        if let Some(snapshot) = previous_snapshot.as_ref() {
+            if snapshot_is_fresh(snapshot, COLLECTION_REFRESH_INTERVAL) {
+                let response = response_from_snapshot_file(snapshot)?;
+                sync_tray_title_from_response(&app, &response);
+                return Ok(response);
+            }
+        }
+    }
+
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .user_agent("lilimit")
@@ -658,16 +734,33 @@ async fn refresh_collected_usage_snapshot(app: AppHandle) -> Result<UsageSnapsho
 
     let mut providers = Vec::new();
     let mut errors = Vec::new();
+    let mut collector_state = read_collector_state();
 
     match fetch_codex_provider(&client).await {
         Ok(provider) => providers.push(provider),
         Err(error) => errors.push(format!("Codex: {error}")),
     }
 
-    match fetch_claude_provider(&client, settings.keychain_access).await {
-        Ok(provider) => providers.push(provider),
-        Err(error) => errors.push(format!("Claude: {error}")),
+    let previous_claude = previous_snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot_provider(snapshot, "Claude"))
+        .cloned();
+    match collect_claude_provider(
+        &client,
+        settings.keychain_access,
+        previous_claude,
+        &mut collector_state,
+    )
+    .await
+    {
+        ClaudeCollectionResult::Provider(provider) => providers.push(provider),
+        ClaudeCollectionResult::Cached { provider, warning } => {
+            providers.push(provider);
+            errors.push(format!("Claude: {warning}"));
+        }
+        ClaudeCollectionResult::Unavailable(error) => errors.push(format!("Claude: {error}")),
     }
+    write_collector_state(&collector_state)?;
 
     if providers.is_empty() {
         return Err(if errors.is_empty() {
@@ -710,6 +803,163 @@ fn write_collected_usage_snapshot(snapshot: &UsageSnapshotFile) -> Result<(), St
     }
     let contents = serde_json::to_string_pretty(snapshot).map_err(|error| error.to_string())?;
     fs::write(path, contents).map_err(|error| error.to_string())
+}
+
+fn response_from_snapshot_file(
+    snapshot: &UsageSnapshotFile,
+) -> Result<UsageSnapshotResponse, String> {
+    let path = collected_usage_snapshot_path()?;
+    let contents = serde_json::to_string(snapshot).map_err(|error| error.to_string())?;
+    Ok(parse_lilimit_snapshot(
+        &contents,
+        &path.to_string_lossy(),
+        SnapshotSource::LilimitCollected,
+    ))
+}
+
+fn snapshot_is_fresh(snapshot: &UsageSnapshotFile, interval: Duration) -> bool {
+    timestamp_is_within(&snapshot.updated_at, interval)
+}
+
+fn timestamp_is_within(value: &str, interval: Duration) -> bool {
+    let Some(timestamp) = parse_rfc3339_datetime(value) else {
+        return false;
+    };
+    let age_seconds = Utc::now().signed_duration_since(timestamp).num_seconds();
+    age_seconds >= 0 && age_seconds < interval.as_secs() as i64
+}
+
+fn snapshot_provider<'a>(snapshot: &'a UsageSnapshotFile, name: &str) -> Option<&'a ProviderUsage> {
+    snapshot
+        .providers
+        .iter()
+        .find(|provider| provider.name.eq_ignore_ascii_case(name))
+}
+
+enum ClaudeCollectionResult {
+    Provider(ProviderUsage),
+    Cached {
+        provider: ProviderUsage,
+        warning: String,
+    },
+    Unavailable(String),
+}
+
+async fn collect_claude_provider(
+    client: &reqwest::Client,
+    keychain_access: KeychainAccess,
+    previous: Option<ProviderUsage>,
+    collector_state: &mut CollectorState,
+) -> ClaudeCollectionResult {
+    if let Some(provider) = previous.as_ref() {
+        if provider
+            .updated_at
+            .as_deref()
+            .is_some_and(|updated_at| timestamp_is_within(updated_at, CLAUDE_REFRESH_INTERVAL))
+        {
+            return ClaudeCollectionResult::Provider(provider.clone());
+        }
+    }
+
+    if let Some(next_attempt_at) = claude_backoff_until(collector_state) {
+        let warning = format!(
+            "rate limited; retry {}",
+            reset_countdown_description(next_attempt_at)
+        );
+        if let Some(provider) = previous {
+            return ClaudeCollectionResult::Cached {
+                provider: stale_provider(provider, warning.clone()),
+                warning,
+            };
+        }
+        return ClaudeCollectionResult::Unavailable(warning);
+    }
+
+    match fetch_claude_provider(client, keychain_access).await {
+        Ok(provider) => {
+            collector_state.claude_next_attempt_at = None;
+            collector_state.claude_rate_limit_failures = 0;
+            ClaudeCollectionResult::Provider(provider)
+        }
+        Err(error) => {
+            if let UsageFetchError::RateLimited(retry_after) = &error {
+                schedule_claude_backoff(collector_state, *retry_after);
+            }
+
+            let message = error.to_string();
+            if let Some(provider) = previous {
+                if should_preserve_claude_provider(&error) {
+                    return ClaudeCollectionResult::Cached {
+                        provider: stale_provider(provider, message.clone()),
+                        warning: format!("{message}; showing cached data"),
+                    };
+                }
+            }
+
+            ClaudeCollectionResult::Unavailable(message)
+        }
+    }
+}
+
+fn stale_provider(mut provider: ProviderUsage, error: String) -> ProviderUsage {
+    provider.stale = true;
+    provider.error = Some(error);
+    provider
+}
+
+fn claude_backoff_until(state: &CollectorState) -> Option<DateTime<Utc>> {
+    let retry_at = state
+        .claude_next_attempt_at
+        .as_deref()
+        .and_then(parse_rfc3339_datetime)?;
+    if retry_at > Utc::now() {
+        Some(retry_at)
+    } else {
+        None
+    }
+}
+
+fn schedule_claude_backoff(state: &mut CollectorState, retry_after: Option<DateTime<Utc>>) {
+    state.claude_rate_limit_failures = state.claude_rate_limit_failures.saturating_add(1).max(1);
+    let backoff = claude_backoff_duration(state.claude_rate_limit_failures);
+    let calculated_retry_at = Utc::now() + chrono::Duration::seconds(backoff.as_secs() as i64);
+    let retry_at = retry_after
+        .filter(|date| *date > Utc::now())
+        .unwrap_or(calculated_retry_at);
+    state.claude_next_attempt_at = Some(retry_at.to_rfc3339_opts(SecondsFormat::Secs, true));
+}
+
+fn claude_backoff_duration(failures: u32) -> Duration {
+    let exponent = failures.saturating_sub(1).min(10);
+    let multiplier = 1_u64.checked_shl(exponent).unwrap_or(u64::MAX);
+    let seconds = CLAUDE_RATE_LIMIT_BASE_BACKOFF
+        .as_secs()
+        .saturating_mul(multiplier)
+        .min(CLAUDE_RATE_LIMIT_MAX_BACKOFF.as_secs());
+    Duration::from_secs(seconds)
+}
+
+fn should_preserve_claude_provider(error: &UsageFetchError) -> bool {
+    match error {
+        UsageFetchError::RateLimited(_) => true,
+        UsageFetchError::Unauthorized => false,
+        UsageFetchError::Message(message) => is_transient_claude_error(message),
+    }
+}
+
+fn is_transient_claude_error(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    lower.contains("timed out")
+        || lower.contains("timeout")
+        || lower.contains("connection")
+        || lower.contains("network")
+        || lower.contains("http 408")
+        || lower.contains("http 425")
+        || lower.contains("http 429")
+        || lower.contains("http 500")
+        || lower.contains("http 502")
+        || lower.contains("http 503")
+        || lower.contains("http 504")
 }
 
 async fn fetch_codex_provider(client: &reqwest::Client) -> Result<ProviderUsage, String> {
@@ -994,6 +1244,8 @@ fn codex_provider_from_usage(response: CodexUsageApiResponse) -> ProviderUsage {
         code_review_remaining_percent: None,
         token_usage: None,
         daily_usage: Vec::new(),
+        stale: false,
+        error: None,
     }
 }
 
@@ -1042,25 +1294,22 @@ fn codex_window_role(window: &RateWindowDetail) -> &'static str {
 async fn fetch_claude_provider(
     client: &reqwest::Client,
     keychain_access: KeychainAccess,
-) -> Result<ProviderUsage, String> {
-    let mut credentials = load_claude_credentials(keychain_access)?;
+) -> Result<ProviderUsage, UsageFetchError> {
+    let mut credentials =
+        load_claude_credentials(keychain_access).map_err(UsageFetchError::Message)?;
     if claude_credentials_are_expired(&credentials) {
-        credentials = refresh_claude_credentials(client, &credentials)
-            .await
-            .map_err(|error| error.to_string())?;
+        credentials = refresh_claude_credentials(client, &credentials).await?;
         if credentials.path.is_some() {
-            save_claude_credentials(&credentials)?;
+            save_claude_credentials(&credentials).map_err(UsageFetchError::Message)?;
         }
     }
 
-    let usage = fetch_claude_usage(client, &credentials)
-        .await
-        .map_err(|error| error.to_string())?;
+    let usage = fetch_claude_usage(client, &credentials).await?;
     Ok(claude_provider_from_usage(usage))
 }
 
 fn load_claude_credentials(keychain_access: KeychainAccess) -> Result<ClaudeCredentials, String> {
-    if let Ok(token) = env::var("CODEXBAR_CLAUDE_OAUTH_TOKEN") {
+    if let Ok(token) = env::var("LILIMIT_CLAUDE_OAUTH_TOKEN") {
         let token = token.trim().to_string();
         if !token.is_empty() {
             return Ok(ClaudeCredentials {
@@ -1159,6 +1408,11 @@ async fn refresh_claude_credentials(
         .map_err(|error| UsageFetchError::Message(error.to_string()))?;
 
     let status = response.status();
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Err(UsageFetchError::RateLimited(parse_retry_after(
+            response.headers().get(reqwest::header::RETRY_AFTER),
+        )));
+    }
     if !status.is_success() {
         return Err(UsageFetchError::Message(format!(
             "Claude OAuth refresh failed with HTTP {}. Run `claude` to authenticate.",
@@ -1249,6 +1503,11 @@ async fn fetch_claude_usage(
         .map_err(|error| UsageFetchError::Message(error.to_string()))?;
 
     let status = response.status();
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Err(UsageFetchError::RateLimited(parse_retry_after(
+            response.headers().get(reqwest::header::RETRY_AFTER),
+        )));
+    }
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
         return Err(UsageFetchError::Unauthorized);
     }
@@ -1349,6 +1608,8 @@ fn claude_provider_from_usage(response: ClaudeOAuthUsageResponse) -> ProviderUsa
         code_review_remaining_percent: None,
         token_usage: None,
         daily_usage: Vec::new(),
+        stale: false,
+        error: None,
     }
 }
 
@@ -1438,6 +1699,17 @@ fn reset_countdown_description(date: DateTime<Utc>) -> String {
 
 fn parse_rfc3339_datetime(value: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|date| date.with_timezone(&Utc))
+}
+
+fn parse_retry_after(value: Option<&reqwest::header::HeaderValue>) -> Option<DateTime<Utc>> {
+    let raw = value?.to_str().ok()?.trim();
+    if let Ok(seconds) = raw.parse::<i64>() {
+        return Some(Utc::now() + chrono::Duration::seconds(seconds.max(0)));
+    }
+
+    DateTime::parse_from_rfc2822(raw)
         .ok()
         .map(|date| date.with_timezone(&Utc))
 }
@@ -1787,6 +2059,8 @@ mod tests {
                 code_review_remaining_percent: None,
                 token_usage: None,
                 daily_usage: Vec::new(),
+                stale: false,
+                error: None,
             },
             ProviderUsage {
                 name: "Claude".to_string(),
@@ -1808,6 +2082,8 @@ mod tests {
                 code_review_remaining_percent: None,
                 token_usage: None,
                 daily_usage: Vec::new(),
+                stale: false,
+                error: None,
             },
         ];
 

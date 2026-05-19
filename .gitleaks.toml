@@ -1,0 +1,17 @@
+title = "lilimit gitleaks configuration"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Project-specific false positives"
+paths = [
+  '''^node_modules/''',
+  '''^dist/''',
+  '''^src-tauri/target/''',
+  '''^src-tauri/gen/''',
+]
+regexes = [
+  '''app_EMoamEEZ73f0CkXaXp7hrann''',
+  '''9d1c250a-e61b-44d9-88ed-5944d1962f5e''',
+]
