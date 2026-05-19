@@ -24,7 +24,6 @@ const QUIT_ID: &str = "quit";
 const TOGGLE_SHORTCUT: &str = "CommandOrControl+Shift+L";
 const SETTINGS_FILE: &str = "settings.json";
 const COLLECTED_USAGE_FILE: &str = "collected_snapshot.json";
-const SAMPLE_USAGE_FILE: &str = "usage_snapshot.json";
 const SIMPLE_WIDTH: f64 = 280.0;
 const SIMPLE_HEIGHT: f64 = 140.0;
 const FULL_WIDTH: f64 = 360.0;
@@ -42,16 +41,12 @@ const CLAUDE_KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 #[derive(Debug, Clone, Copy)]
 enum SnapshotSource {
     LilimitCollected,
-    CodexBarWidget,
-    LilimitSample,
 }
 
 impl SnapshotSource {
     fn as_str(self) -> &'static str {
         match self {
             Self::LilimitCollected => "lilimitCollected",
-            Self::CodexBarWidget => "codexBarWidget",
-            Self::LilimitSample => "lilimitSample",
         }
     }
 }
@@ -86,19 +81,6 @@ fn default_background() -> WidgetBackground {
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-enum DataSource {
-    Auto,
-    Lilimit,
-    CodexBar,
-    Sample,
-}
-
-fn default_data_source() -> DataSource {
-    DataSource::Auto
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
 enum KeychainAccess {
     Off,
     Allow,
@@ -122,8 +104,6 @@ struct WidgetSettings {
     display_mode: DisplayMode,
     #[serde(default = "default_background")]
     background: WidgetBackground,
-    #[serde(default = "default_data_source")]
-    data_source: DataSource,
     #[serde(default = "default_keychain_access")]
     keychain_access: KeychainAccess,
     #[serde(default)]
@@ -135,7 +115,6 @@ impl Default for WidgetSettings {
         Self {
             display_mode: DisplayMode::Simple,
             background: WidgetBackground::Dark,
-            data_source: DataSource::Auto,
             keychain_access: KeychainAccess::Off,
             window_position: None,
         }
@@ -223,52 +202,6 @@ struct UsageSnapshotFile {
     providers: Vec<ProviderUsage>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CodexBarWidgetSnapshot {
-    entries: Vec<CodexBarProviderEntry>,
-    generated_at: String,
-    #[serde(default)]
-    shows_used_percent: bool,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CodexBarProviderEntry {
-    provider: String,
-    #[serde(default)]
-    updated_at: Option<String>,
-    #[serde(default)]
-    primary: Option<CodexBarRateWindow>,
-    #[serde(default)]
-    secondary: Option<CodexBarRateWindow>,
-    #[serde(default)]
-    tertiary: Option<CodexBarRateWindow>,
-    #[serde(default)]
-    usage_rows: Option<Vec<UsageRow>>,
-    #[serde(default)]
-    credits_remaining: Option<f64>,
-    #[serde(default)]
-    code_review_remaining_percent: Option<f64>,
-    #[serde(default)]
-    token_usage: Option<TokenUsageSummary>,
-    #[serde(default)]
-    daily_usage: Vec<DailyUsagePoint>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CodexBarRateWindow {
-    #[serde(default)]
-    used_percent: Option<f64>,
-    #[serde(default)]
-    window_minutes: Option<f64>,
-    #[serde(default)]
-    resets_at: Option<String>,
-    #[serde(default)]
-    reset_description: Option<String>,
-}
-
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct UsageSnapshotResponse {
@@ -281,112 +214,11 @@ struct UsageSnapshotResponse {
     error: Option<String>,
 }
 
-fn usage_snapshot_candidates_for_settings(
-    settings: &WidgetSettings,
-) -> Result<Vec<SnapshotCandidate>, String> {
-    let mut candidates = Vec::new();
-    let collected = SnapshotCandidate {
+fn usage_snapshot_candidate() -> Result<SnapshotCandidate, String> {
+    Ok(SnapshotCandidate {
         path: lilimit_config_dir()?.join(COLLECTED_USAGE_FILE),
         source: SnapshotSource::LilimitCollected,
-    };
-    let sample = SnapshotCandidate {
-        path: lilimit_config_dir()?.join(SAMPLE_USAGE_FILE),
-        source: SnapshotSource::LilimitSample,
-    };
-    let codexbar = codexbar_snapshot_candidates()?;
-
-    match settings.data_source {
-        DataSource::Auto => {
-            candidates.push(collected);
-            candidates.extend(codexbar);
-            candidates.push(sample);
-        }
-        DataSource::Lilimit => {
-            candidates.push(collected);
-            candidates.push(sample);
-        }
-        DataSource::CodexBar => candidates.extend(codexbar),
-        DataSource::Sample => candidates.push(sample),
-    }
-
-    Ok(candidates)
-}
-
-fn codexbar_snapshot_candidates() -> Result<Vec<SnapshotCandidate>, String> {
-    let home = env::var_os("HOME").ok_or_else(|| "HOME is not set".to_string())?;
-    let home = PathBuf::from(home);
-
-    #[cfg(target_os = "macos")]
-    {
-        let group_containers = home.join("Library").join("Group Containers");
-        let application_support = home.join("Library").join("Application Support");
-
-        return Ok(vec![
-            SnapshotCandidate {
-                path: group_containers
-                    .join("Y5PE65HELJ.com.steipete.codexbar")
-                    .join("widget-snapshot.json"),
-                source: SnapshotSource::CodexBarWidget,
-            },
-            SnapshotCandidate {
-                path: group_containers
-                    .join("Y5PE65HELJ.com.steipete.codexbar.debug")
-                    .join("widget-snapshot.json"),
-                source: SnapshotSource::CodexBarWidget,
-            },
-            SnapshotCandidate {
-                path: group_containers
-                    .join("group.com.steipete.codexbar")
-                    .join("widget-snapshot.json"),
-                source: SnapshotSource::CodexBarWidget,
-            },
-            SnapshotCandidate {
-                path: group_containers
-                    .join("group.com.steipete.codexbar.debug")
-                    .join("widget-snapshot.json"),
-                source: SnapshotSource::CodexBarWidget,
-            },
-            SnapshotCandidate {
-                path: application_support
-                    .join("CodexBar")
-                    .join("widget-snapshot.json"),
-                source: SnapshotSource::CodexBarWidget,
-            },
-        ]);
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        return Ok(vec![
-            SnapshotCandidate {
-                path: home
-                    .join(".local")
-                    .join("share")
-                    .join("CodexBar")
-                    .join("widget-snapshot.json"),
-                source: SnapshotSource::CodexBarWidget,
-            },
-            SnapshotCandidate {
-                path: home
-                    .join(".config")
-                    .join("CodexBar")
-                    .join("widget-snapshot.json"),
-                source: SnapshotSource::CodexBarWidget,
-            },
-            SnapshotCandidate {
-                path: home
-                    .join(".config")
-                    .join("codexbar")
-                    .join("widget-snapshot.json"),
-                source: SnapshotSource::CodexBarWidget,
-            },
-        ]);
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        Ok(Vec::new())
-    }
+    })
 }
 
 fn lilimit_config_dir() -> Result<PathBuf, String> {
@@ -493,9 +325,8 @@ fn apply_window_settings<R: Runtime>(window: &WebviewWindow<R>, settings: &Widge
 
 #[tauri::command]
 fn get_usage_snapshot() -> UsageSnapshotResponse {
-    let settings = read_widget_settings().unwrap_or_default();
-    let candidates = match usage_snapshot_candidates_for_settings(&settings) {
-        Ok(candidates) => candidates,
+    let candidate = match usage_snapshot_candidate() {
+        Ok(candidate) => candidate,
         Err(error) => {
             return UsageSnapshotResponse {
                 status: "ioError".to_string(),
@@ -509,47 +340,34 @@ fn get_usage_snapshot() -> UsageSnapshotResponse {
         }
     };
 
-    let missing_path = candidates
-        .first()
-        .map(|candidate| candidate.path.to_string_lossy().into_owned())
-        .unwrap_or_default();
-
-    for candidate in candidates {
-        let path_text = candidate.path.to_string_lossy().into_owned();
-
-        let contents = match fs::read_to_string(&candidate.path) {
-            Ok(contents) => contents,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                return UsageSnapshotResponse {
-                    status: "ioError".to_string(),
-                    path: path_text,
-                    source: Some(candidate.source.as_str().to_string()),
-                    updated_at: None,
-                    shows_used_percent: false,
-                    providers: Vec::new(),
-                    error: Some(error.to_string()),
-                }
+    let path_text = candidate.path.to_string_lossy().into_owned();
+    let contents = match fs::read_to_string(&candidate.path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return UsageSnapshotResponse {
+                status: "missing".to_string(),
+                path: path_text,
+                source: None,
+                updated_at: None,
+                shows_used_percent: false,
+                providers: Vec::new(),
+                error: None,
             }
-        };
-
-        return match candidate.source {
-            SnapshotSource::CodexBarWidget => parse_codexbar_widget_snapshot(&contents, &path_text),
-            SnapshotSource::LilimitCollected | SnapshotSource::LilimitSample => {
-                parse_lilimit_snapshot(&contents, &path_text, candidate.source)
+        }
+        Err(error) => {
+            return UsageSnapshotResponse {
+                status: "ioError".to_string(),
+                path: path_text,
+                source: Some(candidate.source.as_str().to_string()),
+                updated_at: None,
+                shows_used_percent: false,
+                providers: Vec::new(),
+                error: Some(error.to_string()),
             }
-        };
-    }
+        }
+    };
 
-    UsageSnapshotResponse {
-        status: "missing".to_string(),
-        path: missing_path,
-        source: None,
-        updated_at: None,
-        shows_used_percent: false,
-        providers: Vec::new(),
-        error: None,
-    }
+    parse_lilimit_snapshot(&contents, &path_text, candidate.source)
 }
 
 fn parse_lilimit_snapshot(
@@ -575,29 +393,6 @@ fn parse_lilimit_snapshot(
             status: "invalidJson".to_string(),
             path: path_text.to_string(),
             source: Some(source.as_str().to_string()),
-            updated_at: None,
-            shows_used_percent: false,
-            providers: Vec::new(),
-            error: Some(error.to_string()),
-        },
-    }
-}
-
-fn parse_codexbar_widget_snapshot(contents: &str, path_text: &str) -> UsageSnapshotResponse {
-    match serde_json::from_str::<CodexBarWidgetSnapshot>(contents) {
-        Ok(snapshot) => UsageSnapshotResponse {
-            status: "ready".to_string(),
-            path: path_text.to_string(),
-            source: Some(SnapshotSource::CodexBarWidget.as_str().to_string()),
-            updated_at: Some(snapshot.generated_at.clone()),
-            shows_used_percent: snapshot.shows_used_percent,
-            providers: codexbar_widget_providers(snapshot),
-            error: None,
-        },
-        Err(error) => UsageSnapshotResponse {
-            status: "invalidJson".to_string(),
-            path: path_text.to_string(),
-            source: Some(SnapshotSource::CodexBarWidget.as_str().to_string()),
             updated_at: None,
             shows_used_percent: false,
             providers: Vec::new(),
@@ -633,152 +428,39 @@ fn normalize_lilimit_provider(mut provider: ProviderUsage) -> ProviderUsage {
     provider
 }
 
-fn codexbar_widget_providers(snapshot: CodexBarWidgetSnapshot) -> Vec<ProviderUsage> {
-    snapshot
-        .entries
-        .into_iter()
-        .filter_map(|entry| {
-            let name = match entry.provider.as_str() {
-                "codex" => "Codex",
-                "claude" => "Claude",
-                _ => return None,
-            };
-
-            Some(ProviderUsage {
-                name: name.to_string(),
-                session_left_percent: codexbar_row_percent(&entry, &["session", "primary"])
-                    .or_else(|| percent_left_from_window(entry.primary.as_ref())),
-                weekly_left_percent: codexbar_row_percent(&entry, &["weekly", "secondary"])
-                    .or_else(|| percent_left_from_window(entry.secondary.as_ref())),
-                reset_text: codexbar_reset_text(&entry),
-                updated_at: entry.updated_at.clone(),
-                usage_rows: codexbar_usage_rows(&entry),
-                primary: rate_window_detail(entry.primary.as_ref()),
-                secondary: rate_window_detail(entry.secondary.as_ref()),
-                tertiary: rate_window_detail(entry.tertiary.as_ref()),
-                credits_remaining: entry.credits_remaining,
-                code_review_remaining_percent: entry
-                    .code_review_remaining_percent
-                    .map(clamp_percent),
-                token_usage: entry.token_usage.clone(),
-                daily_usage: entry.daily_usage.clone(),
-            })
-        })
-        .collect()
-}
-
-fn codexbar_usage_rows(entry: &CodexBarProviderEntry) -> Vec<UsageRow> {
-    if let Some(rows) = entry.usage_rows.as_ref() {
-        return rows
-            .iter()
-            .map(|row| UsageRow {
-                id: row.id.clone(),
-                title: row.title.clone(),
-                percent_left: row.percent_left.map(clamp_percent),
-                reset_text: codexbar_usage_row_reset_text(&row.id, entry),
-            })
-            .collect();
-    }
-
-    let mut rows = Vec::new();
-    if let Some(primary) = entry.primary.as_ref() {
-        rows.push(UsageRow {
-            id: "primary".to_string(),
-            title: "Session".to_string(),
-            percent_left: percent_left_from_window(Some(primary)),
-            reset_text: rate_window_reset_text(primary),
-        });
-    }
-    if let Some(secondary) = entry.secondary.as_ref() {
-        rows.push(UsageRow {
-            id: "secondary".to_string(),
-            title: "Weekly".to_string(),
-            percent_left: percent_left_from_window(Some(secondary)),
-            reset_text: rate_window_reset_text(secondary),
-        });
-    }
-    if let Some(tertiary) = entry.tertiary.as_ref() {
-        rows.push(UsageRow {
-            id: "tertiary".to_string(),
-            title: "Extra".to_string(),
-            percent_left: percent_left_from_window(Some(tertiary)),
-            reset_text: rate_window_reset_text(tertiary),
-        });
-    }
-    rows
-}
-
-fn codexbar_usage_row_reset_text(id: &str, entry: &CodexBarProviderEntry) -> Option<String> {
-    match id {
-        "session" | "primary" => entry.primary.as_ref().and_then(rate_window_reset_text),
-        "weekly" | "secondary" => entry.secondary.as_ref().and_then(rate_window_reset_text),
-        "opus" | "tertiary" => entry.tertiary.as_ref().and_then(rate_window_reset_text),
-        _ => None,
-    }
-}
-
-fn codexbar_row_percent(entry: &CodexBarProviderEntry, ids: &[&str]) -> Option<f64> {
-    let rows = entry.usage_rows.as_ref()?;
-    rows.iter()
-        .find(|row| {
-            let id = row.id.to_ascii_lowercase();
-            ids.iter().any(|candidate| id == *candidate)
-        })
-        .and_then(|row| row.percent_left)
-        .or_else(|| {
-            rows.iter()
-                .find(|row| {
-                    let title = row.title.to_ascii_lowercase();
-                    ids.iter().any(|candidate| title.contains(candidate))
-                })
-                .and_then(|row| row.percent_left)
-        })
-        .map(clamp_percent)
-}
-
-fn percent_left_from_window(window: Option<&CodexBarRateWindow>) -> Option<f64> {
-    window
-        .and_then(|window| window.used_percent)
-        .map(|used| clamp_percent(100.0 - used))
-}
-
-fn rate_window_detail(window: Option<&CodexBarRateWindow>) -> Option<RateWindowDetail> {
-    window.map(|window| RateWindowDetail {
-        used_percent: window.used_percent.map(clamp_percent),
-        percent_left: percent_left_from_window(Some(window)),
-        window_minutes: window.window_minutes,
-        resets_at: window.resets_at.clone(),
-        reset_description: window.reset_description.clone(),
-    })
-}
-
-fn rate_window_reset_text(window: &CodexBarRateWindow) -> Option<String> {
-    window
-        .reset_description
-        .clone()
-        .filter(|value| !value.is_empty())
-        .or_else(|| window.resets_at.clone())
-}
-
-fn codexbar_reset_text(entry: &CodexBarProviderEntry) -> String {
-    entry
-        .primary
-        .as_ref()
-        .and_then(|window| window.reset_description.clone())
-        .or_else(|| {
-            entry
-                .secondary
-                .as_ref()
-                .and_then(|window| window.reset_description.clone())
-        })
-        .unwrap_or_default()
-}
-
 fn clamp_percent(value: f64) -> f64 {
     if !value.is_finite() {
         return 0.0;
     }
     value.clamp(0.0, 100.0)
+}
+
+fn optional_f64_from_json<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(number)) => number
+            .as_f64()
+            .ok_or_else(|| serde::de::Error::custom("expected finite number"))
+            .map(Some),
+        Some(Value::String(raw)) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                trimmed
+                    .parse::<f64>()
+                    .map(Some)
+                    .map_err(serde::de::Error::custom)
+            }
+        }
+        _ => Err(serde::de::Error::custom(
+            "expected number or numeric string",
+        )),
+    }
 }
 
 #[derive(Debug)]
@@ -849,7 +531,7 @@ struct CodexUsageWindow {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 struct CodexCreditDetails {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "optional_f64_from_json")]
     balance: Option<f64>,
 }
 
@@ -901,11 +583,11 @@ struct ClaudeOAuthWindow {
 struct ClaudeExtraUsage {
     #[serde(default)]
     is_enabled: Option<bool>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "optional_f64_from_json")]
     monthly_limit: Option<f64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "optional_f64_from_json")]
     used_credits: Option<f64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "optional_f64_from_json")]
     utilization: Option<f64>,
     #[serde(default)]
     currency: Option<String>,
@@ -1009,20 +691,13 @@ fn load_codex_credentials() -> Result<CodexCredentials, String> {
     })?;
     let value: Value = serde_json::from_str(&contents).map_err(|error| error.to_string())?;
 
-    if let Some(api_key) = string_at(&value, &["OPENAI_API_KEY"]) {
-        return Ok(CodexCredentials {
-            access_token: api_key,
-            refresh_token: String::new(),
-            id_token: None,
-            account_id: None,
-            last_refresh: None,
-            path,
-        });
-    }
-
-    let tokens = value
-        .get("tokens")
-        .ok_or_else(|| "Codex OAuth tokens missing. Run `codex` to log in.".to_string())?;
+    let tokens = value.get("tokens").ok_or_else(|| {
+        if value.get("OPENAI_API_KEY").is_some() {
+            "Codex is using API-key auth, but usage stats require ChatGPT OAuth tokens. Run `codex` and log in with ChatGPT.".to_string()
+        } else {
+            "Codex OAuth tokens missing. Run `codex` to log in.".to_string()
+        }
+    })?;
     let access_token = string_at(tokens, &["access_token"])
         .or_else(|| string_at(tokens, &["accessToken"]))
         .ok_or_else(|| "Codex OAuth access token missing. Run `codex` to log in.".to_string())?;
@@ -1891,97 +1566,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_codexbar_widget_snapshot_for_codex_and_claude() {
-        let json = r#"{
-          "entries": [
-            {
-              "provider": "codex",
-              "updatedAt": "2026-05-18T21:14:44Z",
-              "usageRows": [
-                { "id": "session", "title": "Session", "percentLeft": 70 },
-                { "id": "weekly", "title": "Weekly", "percentLeft": 83 }
-              ],
-              "primary": { "usedPercent": 30, "resetDescription": "23:25" },
-              "secondary": { "usedPercent": 17, "resetDescription": "May 24" },
-              "tokenUsage": {
-                "sessionCostUSD": 1.25,
-                "sessionTokens": 1234567,
-                "last30DaysCostUSD": 40.5,
-                "last30DaysTokens": 98765432
-              },
-              "dailyUsage": [
-                { "dayKey": "2026-05-18", "costUSD": 1.25, "totalTokens": 1234567 }
-              ]
-            },
-            {
-              "provider": "claude",
-              "updatedAt": "2026-05-18T21:14:45Z",
-              "usageRows": [
-                { "id": "primary", "title": "Session", "percentLeft": 24 },
-                { "id": "secondary", "title": "Weekly", "percentLeft": 80 }
-              ],
-              "primary": { "usedPercent": 76, "resetDescription": "May 19 at 2:50AM" },
-              "secondary": { "usedPercent": 20, "resetDescription": "May 22 at 11:00PM" },
-              "dailyUsage": []
-            }
-          ],
-          "enabledProviders": ["codex", "claude"],
-          "generatedAt": "2026-05-18T21:14:45Z",
-          "showsUsedPercent": false
-        }"#;
-
-        let response = parse_codexbar_widget_snapshot(json, "/tmp/widget-snapshot.json");
-
-        assert_eq!(response.status, "ready");
-        assert_eq!(response.source.as_deref(), Some("codexBarWidget"));
-        assert_eq!(response.updated_at.as_deref(), Some("2026-05-18T21:14:45Z"));
-        assert!(!response.shows_used_percent);
-        assert_eq!(response.providers.len(), 2);
-        assert_eq!(response.providers[0].name, "Codex");
-        assert_eq!(response.providers[0].session_left_percent, Some(70.0));
-        assert_eq!(response.providers[0].weekly_left_percent, Some(83.0));
-        assert_eq!(response.providers[0].reset_text, "23:25");
-        assert_eq!(response.providers[0].usage_rows.len(), 2);
-        assert_eq!(
-            response.providers[0].usage_rows[0].reset_text.as_deref(),
-            Some("23:25")
-        );
-        assert_eq!(
-            response.providers[0]
-                .token_usage
-                .as_ref()
-                .and_then(|usage| usage.session_tokens),
-            Some(1234567)
-        );
-        assert_eq!(response.providers[0].daily_usage.len(), 1);
-        assert_eq!(response.providers[0].daily_usage[0].cost_usd, Some(1.25));
-        assert_eq!(response.providers[1].name, "Claude");
-        assert_eq!(response.providers[1].session_left_percent, Some(24.0));
-        assert_eq!(response.providers[1].weekly_left_percent, Some(80.0));
-    }
-
-    #[test]
-    fn falls_back_to_rate_windows_when_usage_rows_are_missing() {
-        let json = r#"{
-          "entries": [
-            {
-              "provider": "codex",
-              "updatedAt": "2026-05-18T21:14:44Z",
-              "primary": { "usedPercent": 30, "resetDescription": "23:25" },
-              "secondary": { "usedPercent": 17, "resetDescription": "May 24" },
-              "dailyUsage": []
-            }
-          ],
-          "generatedAt": "2026-05-18T21:14:45Z"
-        }"#;
-
-        let response = parse_codexbar_widget_snapshot(json, "/tmp/widget-snapshot.json");
-
-        assert_eq!(response.providers[0].session_left_percent, Some(70.0));
-        assert_eq!(response.providers[0].weekly_left_percent, Some(83.0));
-    }
-
-    #[test]
     fn maps_codex_oauth_usage_to_lilimit_provider() {
         let json = r#"{
           "rate_limit": {
@@ -1996,7 +1580,7 @@ mod tests {
               "limit_window_seconds": 604800
             }
           },
-          "credits": { "balance": 12.5 }
+          "credits": { "balance": "12.5" }
         }"#;
         let response: CodexUsageApiResponse = serde_json::from_str(json).unwrap();
         let provider = codex_provider_from_usage(response);

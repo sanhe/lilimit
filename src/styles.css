@@ -249,10 +249,6 @@ h2 {
   gap: 4px;
 }
 
-.segmented.three {
-  grid-template-columns: 1fr 1fr 1fr;
-}
-
 .segmented button {
   min-width: 0;
   height: 24px;
@@ -525,5 +521,14 @@ code {
   color: var(--muted);
   font-family: ui-monospace, SFMono-Regular, "SF Mono", Consolas, monospace;
   font-size: 10px;
+  overflow-wrap: anywhere;
+}
+
+.state-error {
+  display: block;
+  color: #ef6f6c;
+  font-size: 10.5px;
+  font-weight: 700;
+  line-height: 1.25;
   overflow-wrap: anywhere;
 }
