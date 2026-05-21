@@ -958,7 +958,22 @@ function bindInteractions(): void {
   });
 
   appRoot.querySelector(".close-settings-button")?.addEventListener("click", () => {
-    void currentWindow.hide();
+    hideSettingsWindow();
+  });
+}
+
+function hideSettingsWindow(): void {
+  void currentWindow.hide();
+}
+
+function bindSettingsWindowShortcuts(): void {
+  window.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape") {
+      return;
+    }
+
+    event.preventDefault();
+    hideSettingsWindow();
   });
 }
 
@@ -1024,12 +1039,17 @@ async function initialize(): Promise<void> {
     currentSettings = DEFAULT_SETTINGS;
   }
 
-  await listen<WidgetSettings>("settings-changed", (event) => {
-    currentSettings = normalizeSettings(event.payload);
-    renderAfterSettingsChange();
-  });
+  try {
+    await listen<WidgetSettings>("settings-changed", (event) => {
+      currentSettings = normalizeSettings(event.payload);
+      renderAfterSettingsChange();
+    });
+  } catch (error) {
+    settingsError = error instanceof Error ? error.message : String(error);
+  }
 
   if (isSettingsWindow) {
+    bindSettingsWindowShortcuts();
     renderSettingsWindow();
     return;
   }
