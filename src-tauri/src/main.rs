@@ -763,6 +763,8 @@ struct ClaudeCredentials {
     access_token: String,
     refresh_token: Option<String>,
     expires_at_ms: Option<f64>,
+    rate_limit_tier: Option<String>,
+    subscription_type: Option<String>,
     path: Option<PathBuf>,
 }
 
@@ -1540,6 +1542,19 @@ struct CodexModelPricing {
     cache_rate_above_threshold: Option<f64>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ClaudeModelPricing {
+    input_rate: f64,
+    output_rate: f64,
+    cache_creation_rate: f64,
+    cache_read_rate: f64,
+    threshold_tokens: Option<i64>,
+    input_rate_above_threshold: Option<f64>,
+    output_rate_above_threshold: Option<f64>,
+    cache_creation_rate_above_threshold: Option<f64>,
+    cache_read_rate_above_threshold: Option<f64>,
+}
+
 #[derive(Debug, Default)]
 struct LocalDayUsage {
     total_tokens: i64,
@@ -1615,6 +1630,38 @@ fn load_codex_local_token_usage() -> Option<(Option<TokenUsageSummary>, Vec<Dail
         scan_codex_session_logs(since, today, &mut days, &mut models);
     }
 
+    summarize_local_token_usage(&days, &models)
+}
+
+fn load_claude_local_token_usage() -> Option<(Option<TokenUsageSummary>, Vec<DailyUsagePoint>)> {
+    let cache_dir = home_dir()
+        .ok()?
+        .join("Library")
+        .join("Caches")
+        .join("CodexBar")
+        .join("cost-usage");
+    let today = Local::now().date_naive();
+    let since = today.checked_sub_days(Days::new(29)).unwrap_or(today);
+    let mut days: BTreeMap<String, LocalDayUsage> = BTreeMap::new();
+    let mut models: HashMap<String, LocalModelUsage> = HashMap::new();
+
+    if let Some(cache) = read_json_file::<CodexBarCostCache>(&cache_dir.join("claude-v2.json")) {
+        merge_claude_cost_cache(cache, since, today, &mut days, &mut models);
+    }
+
+    if let Some(cache) =
+        read_json_file::<PiSessionCostCache>(&cache_dir.join("pi-sessions-v2.json"))
+    {
+        merge_pi_claude_cost_cache(cache, since, today, &mut days, &mut models);
+    }
+
+    summarize_local_token_usage(&days, &models)
+}
+
+fn summarize_local_token_usage(
+    days: &BTreeMap<String, LocalDayUsage>,
+    models: &HashMap<String, LocalModelUsage>,
+) -> Option<(Option<TokenUsageSummary>, Vec<DailyUsagePoint>)> {
     if days.is_empty() {
         return None;
     }
@@ -1904,6 +1951,86 @@ fn merge_pi_session_cost_cache(
     }
 }
 
+fn merge_claude_cost_cache(
+    cache: CodexBarCostCache,
+    since: NaiveDate,
+    until: NaiveDate,
+    days: &mut BTreeMap<String, LocalDayUsage>,
+    models: &mut HashMap<String, LocalModelUsage>,
+) {
+    for (day_key, model_values) in cache.days {
+        if !day_key_in_range(&day_key, since, until) {
+            continue;
+        }
+        for (raw_model, packed) in model_values {
+            let model = normalize_claude_model(&raw_model);
+            let input = packed.first().copied().unwrap_or_default();
+            let cache_read = packed.get(1).copied().unwrap_or_default();
+            let cache_create = packed.get(2).copied().unwrap_or_default();
+            let output = packed.get(3).copied().unwrap_or_default();
+            let cached_cost_nanos = packed.get(4).copied().unwrap_or_default();
+            let sample_count = packed.get(5).copied().unwrap_or_default();
+            let priced_sample_count = packed.get(6).copied().unwrap_or_default();
+            let tokens = input
+                .saturating_add(cache_read)
+                .saturating_add(cache_create)
+                .saturating_add(output)
+                .max(0);
+            let has_complete_cached_cost = sample_count > 0 && priced_sample_count == sample_count;
+            let cost = if has_complete_cached_cost {
+                Some(cached_cost_nanos as f64 / 1_000_000_000.0)
+            } else {
+                claude_cost_usd(&model, input, cache_read, cache_create, output)
+            };
+
+            record_daily_usage(days, models, &day_key, &model, tokens, cost);
+        }
+    }
+}
+
+fn merge_pi_claude_cost_cache(
+    cache: PiSessionCostCache,
+    since: NaiveDate,
+    until: NaiveDate,
+    days: &mut BTreeMap<String, LocalDayUsage>,
+    models: &mut HashMap<String, LocalModelUsage>,
+) {
+    let Some(provider_days) = cache.days_by_provider.get("claude") else {
+        return;
+    };
+
+    for (day_key, model_values) in provider_days {
+        if !day_key_in_range(day_key, since, until) {
+            continue;
+        }
+        for (raw_model, packed) in model_values {
+            let model = normalize_claude_model(raw_model);
+            let derived_tokens = packed
+                .input_tokens
+                .saturating_add(packed.cache_read_tokens)
+                .saturating_add(packed.cache_write_tokens)
+                .saturating_add(packed.output_tokens);
+            let tokens = packed.total_tokens.max(derived_tokens).max(0);
+            let has_complete_cached_cost = packed
+                .usage_sample_count
+                .is_some_and(|count| count > 0 && count == packed.cost_sample_count);
+            let cost = if has_complete_cached_cost {
+                Some(packed.cost_nanos as f64 / 1_000_000_000.0)
+            } else {
+                claude_cost_usd(
+                    &model,
+                    packed.input_tokens,
+                    packed.cache_read_tokens,
+                    packed.cache_write_tokens,
+                    packed.output_tokens,
+                )
+            };
+
+            record_daily_usage(days, models, day_key, &model, tokens, cost);
+        }
+    }
+}
+
 fn record_local_usage(
     row_costs: &mut HashMap<(String, String), LocalDayUsage>,
     day_key: &str,
@@ -2168,6 +2295,162 @@ fn codex_model_pricing_exact(model: &str) -> Option<CodexModelPricing> {
     Some(pricing)
 }
 
+fn normalize_claude_model(raw: &str) -> String {
+    let mut model = raw.trim().to_string();
+    if let Some(stripped) = model.strip_prefix("anthropic.") {
+        model = stripped.to_string();
+    }
+    if let Some(last_dot) = model.rfind('.') {
+        let tail = &model[last_dot + 1..];
+        if model.contains("claude-") && tail.starts_with("claude-") {
+            model = tail.to_string();
+        }
+    }
+    if let Some(base) = strip_claude_version_suffix(&model) {
+        model = base.to_string();
+    }
+    if let Some(base) = strip_claude_compact_date_suffix(&model) {
+        if claude_model_pricing_exact(base).is_some() {
+            return base.to_string();
+        }
+    }
+    model
+}
+
+fn strip_claude_version_suffix(model: &str) -> Option<&str> {
+    let start = model.rfind("-v")?;
+    let suffix = &model[start + 2..];
+    let (major, minor) = suffix.split_once(':')?;
+    if !major.is_empty()
+        && !minor.is_empty()
+        && major.bytes().all(|byte| byte.is_ascii_digit())
+        && minor.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Some(&model[..start]);
+    }
+    None
+}
+
+fn strip_claude_compact_date_suffix(model: &str) -> Option<&str> {
+    let bytes = model.as_bytes();
+    if bytes.len() < 9 {
+        return None;
+    }
+    let start = bytes.len() - 9;
+    let suffix = &bytes[start..];
+    (suffix[0] == b'-' && suffix[1..].iter().all(u8::is_ascii_digit)).then_some(&model[..start])
+}
+
+fn claude_cost_usd(
+    model: &str,
+    input_tokens: i64,
+    cache_read_tokens: i64,
+    cache_creation_tokens: i64,
+    output_tokens: i64,
+) -> Option<f64> {
+    let pricing = claude_model_pricing_exact(&normalize_claude_model(model))?;
+    Some(
+        tiered_token_cost(
+            input_tokens,
+            pricing.input_rate,
+            pricing.input_rate_above_threshold,
+            pricing.threshold_tokens,
+        ) + tiered_token_cost(
+            cache_read_tokens,
+            pricing.cache_read_rate,
+            pricing.cache_read_rate_above_threshold,
+            pricing.threshold_tokens,
+        ) + tiered_token_cost(
+            cache_creation_tokens,
+            pricing.cache_creation_rate,
+            pricing.cache_creation_rate_above_threshold,
+            pricing.threshold_tokens,
+        ) + tiered_token_cost(
+            output_tokens,
+            pricing.output_rate,
+            pricing.output_rate_above_threshold,
+            pricing.threshold_tokens,
+        ),
+    )
+}
+
+fn tiered_token_cost(
+    tokens: i64,
+    base_rate: f64,
+    above_threshold_rate: Option<f64>,
+    threshold_tokens: Option<i64>,
+) -> f64 {
+    let tokens = tokens.max(0);
+    let Some(threshold) = threshold_tokens else {
+        return tokens as f64 * base_rate;
+    };
+    let Some(above_threshold_rate) = above_threshold_rate else {
+        return tokens as f64 * base_rate;
+    };
+
+    let below = tokens.min(threshold);
+    let over = tokens.saturating_sub(threshold);
+    below as f64 * base_rate + over as f64 * above_threshold_rate
+}
+
+fn claude_model_pricing_exact(model: &str) -> Option<ClaudeModelPricing> {
+    let pricing = match model {
+        "claude-haiku-4-5-20251001" | "claude-haiku-4-5" => ClaudeModelPricing {
+            input_rate: 1e-6,
+            output_rate: 5e-6,
+            cache_creation_rate: 1.25e-6,
+            cache_read_rate: 1e-7,
+            threshold_tokens: None,
+            input_rate_above_threshold: None,
+            output_rate_above_threshold: None,
+            cache_creation_rate_above_threshold: None,
+            cache_read_rate_above_threshold: None,
+        },
+        "claude-opus-4-5-20251101"
+        | "claude-opus-4-5"
+        | "claude-opus-4-6-20260205"
+        | "claude-opus-4-6"
+        | "claude-opus-4-7" => ClaudeModelPricing {
+            input_rate: 5e-6,
+            output_rate: 2.5e-5,
+            cache_creation_rate: 6.25e-6,
+            cache_read_rate: 5e-7,
+            threshold_tokens: None,
+            input_rate_above_threshold: None,
+            output_rate_above_threshold: None,
+            cache_creation_rate_above_threshold: None,
+            cache_read_rate_above_threshold: None,
+        },
+        "claude-sonnet-4-5"
+        | "claude-sonnet-4-6"
+        | "claude-sonnet-4-5-20250929"
+        | "claude-sonnet-4-20250514" => ClaudeModelPricing {
+            input_rate: 3e-6,
+            output_rate: 1.5e-5,
+            cache_creation_rate: 3.75e-6,
+            cache_read_rate: 3e-7,
+            threshold_tokens: Some(200_000),
+            input_rate_above_threshold: Some(6e-6),
+            output_rate_above_threshold: Some(2.25e-5),
+            cache_creation_rate_above_threshold: Some(7.5e-6),
+            cache_read_rate_above_threshold: Some(6e-7),
+        },
+        "claude-opus-4-20250514" | "claude-opus-4-1" => ClaudeModelPricing {
+            input_rate: 1.5e-5,
+            output_rate: 7.5e-5,
+            cache_creation_rate: 1.875e-5,
+            cache_read_rate: 1.5e-6,
+            threshold_tokens: None,
+            input_rate_above_threshold: None,
+            output_rate_above_threshold: None,
+            cache_creation_rate_above_threshold: None,
+            cache_read_rate_above_threshold: None,
+        },
+        _ => return None,
+    };
+    Some(pricing)
+}
+
 fn codex_plan_display_text(raw: &str) -> Option<String> {
     let normalized = raw.trim().to_lowercase();
     if normalized.is_empty() {
@@ -2199,6 +2482,38 @@ fn codex_plan_display_text(raw: &str) -> Option<String> {
             .join(" "),
     };
     Some(display)
+}
+
+fn claude_plan_display_text(
+    subscription_type: Option<&str>,
+    rate_limit_tier: Option<&str>,
+) -> Option<String> {
+    claude_plan_from_text(subscription_type)
+        .or_else(|| claude_plan_from_text(rate_limit_tier))
+        .map(ToString::to_string)
+}
+
+fn claude_plan_from_text(raw: Option<&str>) -> Option<&'static str> {
+    let normalized = raw?.trim().to_lowercase();
+    if normalized.is_empty() {
+        return None;
+    }
+    if normalized.contains("max") {
+        return Some("Max");
+    }
+    if normalized.contains("pro") {
+        return Some("Pro");
+    }
+    if normalized.contains("team") {
+        return Some("Team");
+    }
+    if normalized.contains("enterprise") {
+        return Some("Enterprise");
+    }
+    if normalized.contains("ultra") {
+        return Some("Ultra");
+    }
+    None
 }
 
 fn rate_window_from_codex(window: &CodexUsageWindow) -> Option<RateWindowDetail> {
@@ -2258,7 +2573,12 @@ async fn fetch_claude_provider(
     }
 
     let usage = fetch_claude_usage(client, &credentials).await?;
-    Ok(claude_provider_from_usage(usage))
+    let plan_text = claude_plan_display_text(
+        credentials.subscription_type.as_deref(),
+        credentials.rate_limit_tier.as_deref(),
+    )
+    .or_else(|| Some("Pro".to_string()));
+    Ok(claude_provider_from_usage_with_plan(usage, plan_text))
 }
 
 fn load_claude_credentials(keychain_access: KeychainAccess) -> Result<ClaudeCredentials, String> {
@@ -2269,6 +2589,8 @@ fn load_claude_credentials(keychain_access: KeychainAccess) -> Result<ClaudeCred
                 access_token: token,
                 refresh_token: None,
                 expires_at_ms: None,
+                rate_limit_tier: None,
+                subscription_type: None,
                 path: None,
             });
         }
@@ -2306,6 +2628,8 @@ fn parse_claude_credentials(contents: &str) -> Result<ClaudeCredentials, String>
         access_token,
         refresh_token: string_at(oauth, &["refreshToken"]),
         expires_at_ms: oauth.get("expiresAt").and_then(Value::as_f64),
+        rate_limit_tier: string_at(oauth, &["rateLimitTier"]),
+        subscription_type: string_at(oauth, &["subscriptionType"]),
         path: None,
     })
 }
@@ -2360,6 +2684,23 @@ async fn fetch_claude_usage(
 }
 
 fn claude_provider_from_usage(response: ClaudeOAuthUsageResponse) -> ProviderUsage {
+    claude_provider_from_usage_with_local_usage(response, Some("Pro".to_string()), None)
+}
+
+fn claude_provider_from_usage_with_plan(
+    response: ClaudeOAuthUsageResponse,
+    plan_text: Option<String>,
+) -> ProviderUsage {
+    let local_usage = load_claude_local_token_usage();
+    claude_provider_from_usage_with_local_usage(response, plan_text, local_usage)
+}
+
+fn claude_provider_from_usage_with_local_usage(
+    response: ClaudeOAuthUsageResponse,
+    plan_text: Option<String>,
+    local_usage: Option<(Option<TokenUsageSummary>, Vec<DailyUsagePoint>)>,
+) -> ProviderUsage {
+    let (token_usage, daily_usage) = local_usage.unwrap_or((None, Vec::new()));
     let primary = response
         .five_hour
         .as_ref()
@@ -2432,7 +2773,7 @@ fn claude_provider_from_usage(response: ClaudeOAuthUsageResponse) -> ProviderUsa
     ProviderUsage {
         name: "Claude".to_string(),
         account_email: None,
-        plan_text: None,
+        plan_text,
         session_left_percent: primary.as_ref().and_then(|window| window.percent_left),
         weekly_left_percent: secondary.as_ref().and_then(|window| window.percent_left),
         reset_text,
@@ -2443,8 +2784,8 @@ fn claude_provider_from_usage(response: ClaudeOAuthUsageResponse) -> ProviderUsa
         tertiary,
         credits_remaining: None,
         code_review_remaining_percent: None,
-        token_usage: None,
-        daily_usage: Vec::new(),
+        token_usage,
+        daily_usage,
         stale: false,
         error: None,
     }
@@ -2480,9 +2821,29 @@ fn extra_usage_window(extra: &ClaudeExtraUsage) -> Option<RateWindowDetail> {
         reset_description: extra.currency.as_ref().and_then(|currency| {
             let used = extra.used_credits?;
             let limit = extra.monthly_limit?;
-            Some(format!("{used:.0}/{limit:.0} {currency}"))
+            let (used, limit) = normalize_claude_extra_usage_amounts(used, limit);
+            Some(format!(
+                "Monthly cap: {} / {}",
+                format_currency_amount(used, currency),
+                format_currency_amount(limit, currency)
+            ))
         }),
     })
+}
+
+fn normalize_claude_extra_usage_amounts(used: f64, limit: f64) -> (f64, f64) {
+    // Claude returns extra usage amounts in minor currency units.
+    (used / 100.0, limit / 100.0)
+}
+
+fn format_currency_amount(value: f64, currency: &str) -> String {
+    match currency.trim().to_uppercase().as_str() {
+        "EUR" => format!("\u{20ac}{value:.2}"),
+        "USD" => format!("${value:.2}"),
+        "GBP" => format!("\u{00a3}{value:.2}"),
+        other if !other.is_empty() => format!("{value:.2} {other}"),
+        _ => format!("{value:.2}"),
+    }
 }
 
 fn rate_window_detail_from_parts(
@@ -3040,7 +3401,14 @@ mod tests {
           "seven_day": { "utilization": 20, "resets_at": "2100-01-08T00:00:00Z" },
           "seven_day_sonnet": { "utilization": 27, "resets_at": "2100-01-08T00:00:00Z" },
           "seven_day_omelette": { "utilization": 0, "resets_at": "2100-01-08T00:00:00Z" },
-          "omelette_promotional": null
+          "omelette_promotional": null,
+          "extra_usage": {
+            "is_enabled": true,
+            "monthly_limit": 1700,
+            "used_credits": 62,
+            "utilization": 4,
+            "currency": "EUR"
+          }
         }"#;
         let response: ClaudeOAuthUsageResponse = serde_json::from_str(json).unwrap();
         let provider = claude_provider_from_usage(response);
@@ -3048,11 +3416,16 @@ mod tests {
         assert_eq!(provider.name, "Claude");
         assert_eq!(provider.session_left_percent, Some(42.0));
         assert_eq!(provider.weekly_left_percent, Some(80.0));
-        assert_eq!(provider.usage_rows.len(), 4);
+        assert_eq!(provider.usage_rows.len(), 5);
         assert!(provider
             .usage_rows
             .iter()
             .any(|row| row.id == "claude-design" && row.percent_left == Some(100.0)));
+        assert!(provider.usage_rows.iter().any(|row| {
+            row.id == "extra-usage"
+                && row.percent_left == Some(96.0)
+                && row.reset_text.as_deref() == Some("Monthly cap: \u{20ac}0.62 / \u{20ac}17.00")
+        }));
     }
 
     #[test]

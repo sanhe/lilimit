@@ -80,7 +80,7 @@ button {
 }
 
 .full-view.widget {
-  grid-template-rows: 28px 1fr 18px;
+  grid-template-rows: 28px auto 1fr 18px;
   gap: 8px;
   padding: 10px 12px;
 }
@@ -411,6 +411,59 @@ h2 {
   padding-right: 2px;
 }
 
+.full-tabs {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  min-width: 0;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--line);
+}
+
+.full-tabs button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  min-width: 0;
+  height: 24px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  cursor: default;
+  font-size: 11.5px;
+  font-weight: 800;
+  padding: 0 6px;
+}
+
+.full-tabs button.active {
+  background: #0b84ff;
+  color: #ffffff;
+}
+
+.full-tabs button:disabled {
+  opacity: 0.42;
+}
+
+.full-tabs svg {
+  flex: 0 0 auto;
+  width: 13px;
+  height: 13px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 2;
+}
+
+.full-tabs span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .full-provider {
   display: grid;
   gap: 10px;
@@ -569,6 +622,65 @@ h2 {
 
 .usage-notes p {
   margin: 0;
+}
+
+.usage-section {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+
+.usage-section h3 {
+  margin: 0;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: 0;
+}
+
+.section-details {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.section-details span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.section-details span:last-child {
+  flex: 0 0 auto;
+  text-align: right;
+}
+
+.cost-summary {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+}
+
+.cost-summary p {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cost-chevron {
+  color: var(--text);
+  font-size: 24px;
+  font-weight: 700;
+  line-height: 1;
 }
 
 footer {

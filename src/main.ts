@@ -9,6 +9,7 @@ type DisplayMode = "simple" | "full";
 type WidgetBackground = "dark" | "light";
 type KeychainAccess = "off" | "allow";
 type ToolbarDisplay = "text" | "bars";
+type FullTab = "overview" | "codex" | "claude";
 
 type WindowPosition = {
   x: number;
@@ -106,6 +107,7 @@ let latestSnapshot: UsageSnapshot | null = null;
 let settingsError: string | null = null;
 let collectionError: string | null = null;
 let refreshInProgress = false;
+let currentFullTab: FullTab = "overview";
 
 function clampPercent(value: number | null): number | null {
   if (value === null || !Number.isFinite(value)) {
@@ -664,15 +666,20 @@ function renderTokenMetrics(tokenUsage: TokenUsageSummary | null): string {
   `;
 }
 
-function renderUsageNotes(tokenUsage: TokenUsageSummary | null): string {
-  if (!tokenUsage) {
+function renderUsageNotes(provider: ProviderUsage): string {
+  if (!provider.tokenUsage) {
     return "";
   }
+  const tokenUsage = provider.tokenUsage;
+  const isClaude = provider.name.toLowerCase() === "claude";
+  const estimateText = isClaude
+    ? "Estimated from local Claude logs at API rates; token totals include cache"
+    : "Estimated from local logs - may differ from your bill";
 
   return `
     <div class="usage-notes">
       ${tokenUsage.topModel ? `<p>Top model: ${escapeHtml(tokenUsage.topModel)}</p>` : ""}
-      <p>Estimated from local logs - may differ from your bill</p>
+      <p>${escapeHtml(estimateText)}</p>
     </div>
   `;
 }
@@ -720,9 +727,99 @@ function renderHistory(points: DailyUsagePoint[], color: string): string {
   `;
 }
 
+function parseAmountText(value: string): number | null {
+  const normalized = value.replace(/,/g, "");
+  const parsed = Number.parseFloat(normalized);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function formatMajorAmount(value: number): string {
+  return new Intl.NumberFormat(undefined, {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  }).format(value);
+}
+
+function normalizeExtraUsageResetText(resetText: string | null): string {
+  if (!resetText) {
+    return "";
+  }
+
+  const amountPattern = String.raw`([^\d-]*)(-?\d[\d,.]*)(\s*[A-Z]{3})?`;
+  const match = resetText.match(
+    new RegExp(String.raw`^(.*?:\s*)${amountPattern}\s*\/\s*${amountPattern}\s*$`),
+  );
+  if (!match) {
+    return resetText;
+  }
+
+  const [, label, usedPrefix, usedRaw, usedSuffix = "", limitPrefix, limitRaw, limitSuffix = ""] =
+    match;
+  const used = parseAmountText(usedRaw);
+  const limit = parseAmountText(limitRaw);
+  const hasCurrency = Boolean(
+    usedPrefix.trim() || usedSuffix.trim() || limitPrefix.trim() || limitSuffix.trim(),
+  );
+  if (used === null || limit === null || !hasCurrency || limit < 100) {
+    return resetText;
+  }
+
+  return `${label}${usedPrefix}${formatMajorAmount(used / 100)}${usedSuffix} / ${limitPrefix}${formatMajorAmount(limit / 100)}${limitSuffix}`;
+}
+
+function renderExtraUsageSection(row: UsageRow, color: string): string {
+  const percentLeft = clampPercent(row.percentLeft);
+  const usedPercent = percentLeft === null ? null : 100 - percentLeft;
+  const width = usedPercent === null ? 0 : usedPercent;
+  const resetText = escapeHtml(normalizeExtraUsageResetText(row.resetText));
+  const usedText = usedPercent === null ? "" : `${usedPercent}% used`;
+
+  return `
+    <div class="usage-section extra-usage-section">
+      <h3>${escapeHtml(row.title)}</h3>
+      <div class="meter full-meter">
+        <div class="meter-fill" style="width: ${width}%; background: ${color}"></div>
+      </div>
+      <div class="section-details">
+        <span>${resetText}</span>
+        <span>${escapeHtml(usedText)}</span>
+      </div>
+    </div>
+  `;
+}
+
+function formatCostAndTokens(cost: number | null, tokens: number | null): string {
+  const parts = [
+    cost === null ? null : formatUsd(cost),
+    tokens === null ? null : `${formatTokens(tokens)} tokens`,
+  ].filter((value): value is string => Boolean(value));
+
+  return parts.length > 0 ? parts.join(" &middot; ") : "-";
+}
+
+function renderClaudeCostSummary(provider: ProviderUsage): string {
+  if (provider.name.toLowerCase() !== "claude" || !provider.tokenUsage) {
+    return "";
+  }
+
+  const tokenUsage = provider.tokenUsage;
+  return `
+    <div class="usage-section cost-summary">
+      <div>
+        <h3>Cost</h3>
+        <p>Today: ${formatCostAndTokens(tokenUsage.sessionCostUSD, tokenUsage.sessionTokens)}</p>
+        <p>Last 30 days: ${formatCostAndTokens(tokenUsage.last30DaysCostUSD, tokenUsage.last30DaysTokens)}</p>
+      </div>
+      <span class="cost-chevron" aria-hidden="true">&rsaquo;</span>
+    </div>
+  `;
+}
+
 function renderFullProvider(provider: ProviderUsage, showsUsedPercent: boolean): string {
   const color = providerColor(provider.name);
   const rows = provider.usageRows.length > 0 ? provider.usageRows : fallbackRows(provider);
+  const standardRows = rows.filter((row) => row.id !== "extra-usage");
+  const extraUsageRows = rows.filter((row) => row.id === "extra-usage");
   const name = escapeHtml(provider.name);
   const updatedAt = provider.updatedAt ?? latestSnapshot?.updatedAt ?? null;
   const providerIsStale = provider.stale || isStale(updatedAt);
@@ -731,7 +828,7 @@ function renderFullProvider(provider: ProviderUsage, showsUsedPercent: boolean):
     ? `<span class="provider-state"${stateTitle}>stale</span>`
     : "";
   const usageRows = [
-    ...rows.map((row) => renderFullUsageRow(provider, row, color, showsUsedPercent)),
+    ...standardRows.map((row) => renderFullUsageRow(provider, row, color, showsUsedPercent)),
     provider.codeReviewRemainingPercent !== null
       ? renderFullUsageRow(
           provider,
@@ -761,9 +858,108 @@ function renderFullProvider(provider: ProviderUsage, showsUsedPercent: boolean):
       </div>
       ${renderTokenMetrics(provider.tokenUsage)}
       ${renderHistory(provider.dailyUsage, color)}
-      ${renderUsageNotes(provider.tokenUsage)}
+      ${renderUsageNotes(provider)}
+      ${extraUsageRows.map((row) => renderExtraUsageSection(row, color)).join("")}
+      ${renderClaudeCostSummary(provider)}
     </section>
   `;
+}
+
+function providerForFullTab(provider: ProviderUsage): FullTab | null {
+  switch (provider.name.toLowerCase()) {
+    case "codex":
+      return "codex";
+    case "claude":
+      return "claude";
+    default:
+      return null;
+  }
+}
+
+function fullTabLabel(tab: FullTab): string {
+  switch (tab) {
+    case "overview":
+      return "Overview";
+    case "codex":
+      return "Codex";
+    case "claude":
+      return "Claude";
+  }
+}
+
+function renderFullTabIcon(tab: FullTab): string {
+  switch (tab) {
+    case "overview":
+      return `
+        <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+          <rect x="4" y="4" width="6" height="6" rx="1.2"></rect>
+          <rect x="14" y="4" width="6" height="6" rx="1.2"></rect>
+          <rect x="4" y="14" width="6" height="6" rx="1.2"></rect>
+          <rect x="14" y="14" width="6" height="6" rx="1.2"></rect>
+        </svg>
+      `;
+    case "codex":
+      return `
+        <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+          <path d="M12 3.5a8.5 8.5 0 0 1 7.4 12.7"></path>
+          <path d="M18 7.2a8.5 8.5 0 0 1-7.2 13.2"></path>
+          <path d="M12 20.5A8.5 8.5 0 0 1 4.6 7.8"></path>
+          <path d="M6 16.8A8.5 8.5 0 0 1 13.2 3.6"></path>
+        </svg>
+      `;
+    case "claude":
+      return `
+        <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+          <path d="M12 3v18"></path>
+          <path d="M3 12h18"></path>
+          <path d="M5.6 5.6l12.8 12.8"></path>
+          <path d="M18.4 5.6 5.6 18.4"></path>
+          <path d="M8.5 3.8 15.5 20.2"></path>
+          <path d="M15.5 3.8 8.5 20.2"></path>
+        </svg>
+      `;
+  }
+}
+
+function renderFullTabs(providers: ProviderUsage[]): string {
+  const availableTabs = new Set<FullTab>(["overview"]);
+  providers.forEach((provider) => {
+    const tab = providerForFullTab(provider);
+    if (tab) {
+      availableTabs.add(tab);
+    }
+  });
+
+  return `
+    <nav class="full-tabs" aria-label="Full view provider tabs">
+      ${(["overview", "codex", "claude"] as FullTab[])
+        .map((tab) => {
+          const active = currentFullTab === tab;
+          const disabled = !availableTabs.has(tab);
+          return `
+            <button
+              type="button"
+              class="${active ? "active" : ""}"
+              data-full-tab="${tab}"
+              aria-selected="${active}"
+              ${disabled ? "disabled" : ""}
+            >
+              ${renderFullTabIcon(tab)}
+              <span>${fullTabLabel(tab)}</span>
+            </button>
+          `;
+        })
+        .join("")}
+    </nav>
+  `;
+}
+
+function fullTabProviders(providers: ProviderUsage[]): ProviderUsage[] {
+  if (currentFullTab === "overview") {
+    return providers;
+  }
+
+  return providers.filter((provider) => providerForFullTab(provider) === currentFullTab);
 }
 
 function renderState(snapshot: UsageSnapshot): string {
@@ -810,14 +1006,16 @@ function renderReady(snapshot: UsageSnapshot): string {
   const mode = currentSettings.displayMode;
 
   if (mode === "full") {
+    const visibleProviders = fullTabProviders(providers);
     return `
       <main class="surface widget full-view ${currentSettings.background}-bg" data-tauri-drag-region>
         ${renderTitlebar(stale)}
+        ${renderFullTabs(providers)}
         <div class="full-content">
           ${
-            providers.length > 0
-              ? providers.map((provider) => renderFullProvider(provider, snapshot.showsUsedPercent)).join("")
-              : '<p class="empty">No provider data</p>'
+            visibleProviders.length > 0
+              ? visibleProviders.map((provider) => renderFullProvider(provider, snapshot.showsUsedPercent)).join("")
+              : `<p class="empty">No ${escapeHtml(fullTabLabel(currentFullTab))} data</p>`
           }
         </div>
         <footer data-tauri-drag-region>
@@ -950,6 +1148,16 @@ function bindInteractions(): void {
       const displayMode: DisplayMode =
         button.dataset.nextDisplayMode === "full" ? "full" : "simple";
       void saveSettings({ displayMode });
+    });
+  });
+
+  appRoot.querySelectorAll<HTMLButtonElement>("[data-full-tab]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const tab = button.dataset.fullTab;
+      if (tab === "overview" || tab === "codex" || tab === "claude") {
+        currentFullTab = tab;
+        renderCurrent();
+      }
     });
   });
 
