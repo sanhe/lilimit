@@ -1,4 +1,10 @@
-use std::{env, fs, path::PathBuf, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap},
+    env, fs,
+    io::{BufRead, BufReader},
+    path::{Path, PathBuf},
+    time::Duration,
+};
 #[cfg(target_os = "macos")]
 use std::{
     io::Read,
@@ -7,8 +13,8 @@ use std::{
     time::Instant,
 };
 
-use chrono::{DateTime, SecondsFormat, Utc};
-use serde::{Deserialize, Serialize};
+use chrono::{DateTime, Days, Local, NaiveDate, SecondsFormat, Utc};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{
     image::Image,
@@ -19,8 +25,7 @@ use tauri::{
 };
 use tauri_plugin_global_shortcut::ShortcutState;
 
-const SHOW_WIDGET_ID: &str = "show_widget";
-const HIDE_WIDGET_ID: &str = "hide_widget";
+const TOGGLE_WIDGET_ID: &str = "toggle_widget";
 const QUIT_ID: &str = "quit";
 const TRAY_ID: &str = "lilimit";
 const TOGGLE_SHORTCUT: &str = "CommandOrControl+Shift+L";
@@ -164,6 +169,8 @@ struct TokenUsageSummary {
     last30_days_cost_usd: Option<f64>,
     #[serde(default)]
     last30_days_tokens: Option<i64>,
+    #[serde(default)]
+    top_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -190,6 +197,10 @@ struct RateWindowDetail {
 #[serde(rename_all = "camelCase")]
 struct ProviderUsage {
     name: String,
+    #[serde(default)]
+    account_email: Option<String>,
+    #[serde(default)]
+    plan_text: Option<String>,
     #[serde(default)]
     session_left_percent: Option<f64>,
     #[serde(default)]
@@ -352,16 +363,25 @@ fn save_widget_settings(
     app: AppHandle,
 ) -> Result<WidgetSettings, String> {
     let mut next = settings;
+    let existing = read_widget_settings().unwrap_or_default();
     if next.window_position.is_none() {
-        if let Ok(existing) = read_widget_settings() {
-            next.window_position = existing.window_position;
-        }
+        next.window_position = existing.window_position;
     }
+    let display_mode_changed = next.display_mode != existing.display_mode;
 
     write_widget_settings(&next)?;
 
     if let Some(window) = app.get_webview_window("main") {
-        apply_window_settings(&window, &next);
+        if let Some(position) = apply_window_settings(&window, &next, display_mode_changed) {
+            let adjusted_position = WindowPosition {
+                x: position.x,
+                y: position.y,
+            };
+            if next.window_position != Some(adjusted_position) {
+                next.window_position = Some(adjusted_position);
+                write_widget_settings(&next)?;
+            }
+        }
     }
     let _ = app.emit_to("main", "settings-changed", &next);
     let _ = app.emit_to("settings", "settings-changed", &next);
@@ -392,17 +412,168 @@ fn window_size(display_mode: DisplayMode) -> (f64, f64) {
     }
 }
 
-fn apply_window_settings<R: Runtime>(window: &WebviewWindow<R>, settings: &WidgetSettings) {
+fn apply_window_settings<R: Runtime>(
+    window: &WebviewWindow<R>,
+    settings: &WidgetSettings,
+    preserve_right_edge: bool,
+) -> Option<PhysicalPosition<i32>> {
     let (width, height) = window_size(settings.display_mode);
+    let current_position = window.outer_position().ok();
+    let current_size = window.outer_size().ok();
+
+    let stored_position = settings
+        .window_position
+        .map(|position| PhysicalPosition::new(position.x, position.y));
+    let position = if preserve_right_edge {
+        current_position.or(stored_position)
+    } else {
+        stored_position.or(current_position)
+    }?;
+    let position = clamp_window_position(
+        window,
+        position,
+        current_size.map(|size| size.width),
+        width,
+        height,
+        preserve_right_edge,
+    );
+
     let _ = window.set_size(Size::Logical(LogicalSize::new(width, height)));
 
-    if let Some(position) = settings.window_position {
-        // Tauri reports physical coordinates. They can be negative on macOS or
-        // Linux multi-monitor layouts, so store and replay the raw values.
-        let _ = window.set_position(Position::Physical(PhysicalPosition::new(
-            position.x, position.y,
-        )));
+    // Tauri reports physical coordinates. They can be negative on macOS or
+    // Linux multi-monitor layouts, so store and replay the raw values.
+    let _ = window.set_position(Position::Physical(position));
+    Some(position)
+}
+
+fn clamp_window_position<R: Runtime>(
+    window: &WebviewWindow<R>,
+    position: PhysicalPosition<i32>,
+    current_width: Option<u32>,
+    logical_width: f64,
+    logical_height: f64,
+    preserve_right_edge: bool,
+) -> PhysicalPosition<i32> {
+    let Some((left, top, right, bottom, scale_factor)) = work_area_for_position(window, position)
+    else {
+        return position;
+    };
+    let width = (logical_width * scale_factor).ceil() as i32;
+    let height = (logical_height * scale_factor).ceil() as i32;
+    let position = if preserve_right_edge {
+        current_width
+            .and_then(|width| i32::try_from(width).ok())
+            .map(|current_width| right_edge_anchored_position(position, current_width, width))
+            .unwrap_or(position)
+    } else {
+        position
+    };
+
+    clamp_position_to_bounds(position, width, height, left, top, right, bottom)
+}
+
+fn right_edge_anchored_position(
+    position: PhysicalPosition<i32>,
+    current_width: i32,
+    target_width: i32,
+) -> PhysicalPosition<i32> {
+    PhysicalPosition::new(
+        position
+            .x
+            .saturating_add(current_width)
+            .saturating_sub(target_width),
+        position.y,
+    )
+}
+
+fn work_area_for_position<R: Runtime>(
+    window: &WebviewWindow<R>,
+    position: PhysicalPosition<i32>,
+) -> Option<(i32, i32, i32, i32, f64)> {
+    if let Ok(monitors) = window.available_monitors() {
+        if let Some(monitor) = monitors
+            .into_iter()
+            .find(|monitor| work_area_contains(monitor.work_area(), position))
+        {
+            let area = monitor.work_area();
+            return Some(work_area_bounds(
+                area.position.x,
+                area.position.y,
+                area.size.width,
+                area.size.height,
+                monitor.scale_factor(),
+            ));
+        }
     }
+
+    window.current_monitor().ok().flatten().map(|monitor| {
+        let area = monitor.work_area();
+        work_area_bounds(
+            area.position.x,
+            area.position.y,
+            area.size.width,
+            area.size.height,
+            monitor.scale_factor(),
+        )
+    })
+}
+
+fn work_area_contains(
+    area: &tauri::PhysicalRect<i32, u32>,
+    position: PhysicalPosition<i32>,
+) -> bool {
+    let (left, top, right, bottom, _) = work_area_bounds(
+        area.position.x,
+        area.position.y,
+        area.size.width,
+        area.size.height,
+        1.0,
+    );
+
+    position.x >= left && position.x < right && position.y >= top && position.y < bottom
+}
+
+fn work_area_bounds(
+    left: i32,
+    top: i32,
+    width: u32,
+    height: u32,
+    scale_factor: f64,
+) -> (i32, i32, i32, i32, f64) {
+    let width = i32::try_from(width).unwrap_or(i32::MAX);
+    let height = i32::try_from(height).unwrap_or(i32::MAX);
+
+    (
+        left,
+        top,
+        left.saturating_add(width),
+        top.saturating_add(height),
+        scale_factor,
+    )
+}
+
+fn clamp_position_to_bounds(
+    position: PhysicalPosition<i32>,
+    width: i32,
+    height: i32,
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+) -> PhysicalPosition<i32> {
+    let max_x = right.saturating_sub(width);
+    let max_y = bottom.saturating_sub(height);
+    let x = clamp_axis(position.x, left, max_x);
+    let y = clamp_axis(position.y, top, max_y);
+
+    PhysicalPosition::new(x, y)
+}
+
+fn clamp_axis(value: i32, min: i32, max: i32) -> i32 {
+    if max < min {
+        return min;
+    }
+    value.clamp(min, max)
 }
 
 #[tauri::command]
@@ -598,6 +769,10 @@ struct ClaudeCredentials {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 struct CodexUsageApiResponse {
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    plan_type: Option<String>,
     #[serde(default)]
     rate_limit: Option<CodexRateLimitDetails>,
     #[serde(default)]
@@ -826,6 +1001,8 @@ fn write_collected_usage_snapshot(snapshot: &UsageSnapshotFile) -> Result<(), St
 fn unavailable_provider(name: &str, error: String) -> ProviderUsage {
     ProviderUsage {
         name: name.to_string(),
+        account_email: None,
+        plan_text: None,
         session_left_percent: None,
         weekly_left_percent: None,
         reset_text: "auth".to_string(),
@@ -1268,9 +1445,16 @@ fn codex_provider_from_usage(response: CodexUsageApiResponse) -> ProviderUsage {
         .as_ref()
         .and_then(|window| window.reset_description.clone())
         .unwrap_or_default();
+    let local_usage = load_codex_local_token_usage();
+    let (token_usage, daily_usage) = local_usage.unwrap_or((None, Vec::new()));
 
     ProviderUsage {
         name: "Codex".to_string(),
+        account_email: response.email,
+        plan_text: response
+            .plan_type
+            .as_deref()
+            .and_then(codex_plan_display_text),
         session_left_percent: primary.as_ref().and_then(|window| window.percent_left),
         weekly_left_percent: secondary.as_ref().and_then(|window| window.percent_left),
         reset_text,
@@ -1281,11 +1465,740 @@ fn codex_provider_from_usage(response: CodexUsageApiResponse) -> ProviderUsage {
         tertiary: None,
         credits_remaining: response.credits.and_then(|credits| credits.balance),
         code_review_remaining_percent: None,
-        token_usage: None,
-        daily_usage: Vec::new(),
+        token_usage,
+        daily_usage,
         stale: false,
         error: None,
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexBarCostCache {
+    #[serde(default)]
+    days: HashMap<String, HashMap<String, Vec<i64>>>,
+    #[serde(default)]
+    files: HashMap<String, CodexBarCostFile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexBarCostFile {
+    #[serde(default)]
+    codex_rows: Vec<CodexBarCodexRow>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexBarCodexRow {
+    day: String,
+    model: String,
+    #[serde(default)]
+    input: i64,
+    #[serde(default)]
+    cached: i64,
+    #[serde(default)]
+    output: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PiSessionCostCache {
+    #[serde(default)]
+    days_by_provider: HashMap<String, HashMap<String, HashMap<String, PiPackedUsage>>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PiPackedUsage {
+    #[serde(default)]
+    input_tokens: i64,
+    #[serde(default)]
+    cache_read_tokens: i64,
+    #[serde(default)]
+    cache_write_tokens: i64,
+    #[serde(default)]
+    output_tokens: i64,
+    #[serde(default)]
+    total_tokens: i64,
+    #[serde(default)]
+    cost_nanos: i64,
+    #[serde(default)]
+    cost_sample_count: i64,
+    #[serde(default)]
+    usage_sample_count: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CodexModelPricing {
+    input_rate: f64,
+    output_rate: f64,
+    cache_rate: Option<f64>,
+    threshold_tokens: Option<i64>,
+    input_rate_above_threshold: Option<f64>,
+    output_rate_above_threshold: Option<f64>,
+    cache_rate_above_threshold: Option<f64>,
+}
+
+#[derive(Debug, Default)]
+struct LocalDayUsage {
+    total_tokens: i64,
+    cost_usd: f64,
+    cost_seen: bool,
+}
+
+#[derive(Debug, Default)]
+struct LocalModelUsage {
+    total_tokens: i64,
+    cost_usd: f64,
+    cost_seen: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct CodexTokenTotals {
+    input: i64,
+    cached: i64,
+    output: i64,
+}
+
+impl CodexTokenTotals {
+    fn total_tokens(self) -> i64 {
+        self.input.saturating_add(self.output).max(0)
+    }
+
+    fn add(self, other: CodexTokenTotals) -> CodexTokenTotals {
+        CodexTokenTotals {
+            input: self.input.saturating_add(other.input),
+            cached: self.cached.saturating_add(other.cached),
+            output: self.output.saturating_add(other.output),
+        }
+    }
+
+    fn delta_from(self, previous: CodexTokenTotals) -> CodexTokenTotals {
+        if self.input >= previous.input
+            && self.cached >= previous.cached
+            && self.output >= previous.output
+        {
+            return CodexTokenTotals {
+                input: self.input.saturating_sub(previous.input),
+                cached: self.cached.saturating_sub(previous.cached),
+                output: self.output.saturating_sub(previous.output),
+            };
+        }
+        self
+    }
+}
+
+fn load_codex_local_token_usage() -> Option<(Option<TokenUsageSummary>, Vec<DailyUsagePoint>)> {
+    let cache_dir = home_dir()
+        .ok()?
+        .join("Library")
+        .join("Caches")
+        .join("CodexBar")
+        .join("cost-usage");
+    let today = Local::now().date_naive();
+    let since = today.checked_sub_days(Days::new(29)).unwrap_or(today);
+    let mut days: BTreeMap<String, LocalDayUsage> = BTreeMap::new();
+    let mut models: HashMap<String, LocalModelUsage> = HashMap::new();
+
+    if let Some(cache) = read_json_file::<CodexBarCostCache>(&cache_dir.join("codex-v7.json")) {
+        merge_codexbar_cost_cache(cache, since, today, &mut days, &mut models);
+    }
+
+    if let Some(cache) =
+        read_json_file::<PiSessionCostCache>(&cache_dir.join("pi-sessions-v2.json"))
+    {
+        merge_pi_session_cost_cache(cache, since, today, &mut days, &mut models);
+    }
+
+    if days.is_empty() {
+        scan_codex_session_logs(since, today, &mut days, &mut models);
+    }
+
+    if days.is_empty() {
+        return None;
+    }
+
+    let current_day = days.iter().next_back().map(|(_, usage)| usage);
+    let total_tokens = days.values().map(|usage| usage.total_tokens).sum::<i64>();
+    let cost_seen = days.values().any(|usage| usage.cost_seen);
+    let total_cost = days.values().map(|usage| usage.cost_usd).sum::<f64>();
+    let top_model = top_local_model(&models);
+    let daily_usage = days
+        .iter()
+        .map(|(day_key, usage)| DailyUsagePoint {
+            day_key: day_key.clone(),
+            total_tokens: (usage.total_tokens > 0).then_some(usage.total_tokens),
+            cost_usd: usage.cost_seen.then_some(usage.cost_usd),
+        })
+        .collect::<Vec<_>>();
+
+    let token_usage = TokenUsageSummary {
+        session_cost_usd: current_day.and_then(|usage| usage.cost_seen.then_some(usage.cost_usd)),
+        session_tokens: current_day
+            .and_then(|usage| (usage.total_tokens > 0).then_some(usage.total_tokens)),
+        last30_days_cost_usd: cost_seen.then_some(total_cost),
+        last30_days_tokens: (total_tokens > 0).then_some(total_tokens),
+        top_model,
+    };
+
+    Some((Some(token_usage), daily_usage))
+}
+
+fn scan_codex_session_logs(
+    since: NaiveDate,
+    until: NaiveDate,
+    days: &mut BTreeMap<String, LocalDayUsage>,
+    models: &mut HashMap<String, LocalModelUsage>,
+) {
+    let Ok(root) = codex_home_dir().map(|path| path.join("sessions")) else {
+        return;
+    };
+    let mut files = Vec::new();
+    collect_codex_session_files(&root, since, until, &mut files);
+    files.sort();
+    for path in files {
+        scan_codex_session_file(&path, since, until, days, models);
+    }
+}
+
+fn collect_codex_session_files(
+    root: &Path,
+    since: NaiveDate,
+    until: NaiveDate,
+    files: &mut Vec<PathBuf>,
+) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_codex_session_files(&path, since, until, files);
+            continue;
+        }
+
+        if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+            continue;
+        }
+        if codex_session_file_date(&path)
+            .map(|date| date >= since && date <= until)
+            .unwrap_or(false)
+        {
+            files.push(path);
+        }
+    }
+}
+
+fn scan_codex_session_file(
+    path: &Path,
+    since: NaiveDate,
+    until: NaiveDate,
+    days: &mut BTreeMap<String, LocalDayUsage>,
+    models: &mut HashMap<String, LocalModelUsage>,
+) {
+    let Ok(file) = fs::File::open(path) else {
+        return;
+    };
+    let reader = BufReader::new(file);
+    let mut current_model = String::new();
+    let mut previous_total: Option<CodexTokenTotals> = None;
+
+    for line in reader.lines().map_while(Result::ok) {
+        if !(line.contains("\"token_count\"") || line.contains("\"turn_context\"")) {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+
+        if value.get("type").and_then(Value::as_str) == Some("turn_context") {
+            if let Some(model) = string_at(&value, &["payload", "model"]) {
+                current_model = normalize_codex_model(&model);
+            }
+            continue;
+        }
+
+        let Some(payload) = value.get("payload") else {
+            continue;
+        };
+        if payload.get("type").and_then(Value::as_str) != Some("token_count") {
+            continue;
+        }
+
+        let Some(timestamp) = value.get("timestamp").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(day_key) = local_day_key_from_timestamp(timestamp) else {
+            continue;
+        };
+        let day_in_range = day_key_in_range(&day_key, since, until);
+        let info = payload.get("info").filter(|value| !value.is_null());
+        let total = info
+            .and_then(|info| info.get("total_token_usage"))
+            .map(codex_totals_from_value);
+        let last = info
+            .and_then(|info| info.get("last_token_usage"))
+            .map(codex_totals_from_value);
+
+        let delta = if let Some(total) = total {
+            let delta = previous_total
+                .map(|previous| total.delta_from(previous))
+                .unwrap_or(total);
+            previous_total = Some(total);
+            delta
+        } else if let Some(last) = last {
+            previous_total = Some(previous_total.unwrap_or_default().add(last));
+            last
+        } else {
+            continue;
+        };
+
+        if !day_in_range || current_model.is_empty() || delta.total_tokens() <= 0 {
+            continue;
+        }
+        let cost = codex_cost_usd(&current_model, delta.input, delta.cached, delta.output);
+        record_daily_usage(
+            days,
+            models,
+            &day_key,
+            &current_model,
+            delta.total_tokens(),
+            cost,
+        );
+    }
+}
+
+fn codex_session_file_date(path: &Path) -> Option<NaiveDate> {
+    let filename = path.file_name()?.to_str()?;
+    let date = filename.strip_prefix("rollout-")?.get(..10)?;
+    NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()
+}
+
+fn local_day_key_from_timestamp(timestamp: &str) -> Option<String> {
+    DateTime::parse_from_rfc3339(timestamp).ok().map(|date| {
+        date.with_timezone(&Local)
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string()
+    })
+}
+
+fn codex_totals_from_value(value: &Value) -> CodexTokenTotals {
+    CodexTokenTotals {
+        input: i64_at(value, &["input_tokens"]).unwrap_or_default().max(0),
+        cached: i64_at(value, &["cached_input_tokens"])
+            .or_else(|| i64_at(value, &["cache_read_input_tokens"]))
+            .unwrap_or_default()
+            .max(0),
+        output: i64_at(value, &["output_tokens"]).unwrap_or_default().max(0),
+    }
+}
+
+fn i64_at(value: &Value, keys: &[&str]) -> Option<i64> {
+    let mut current = value;
+    for key in keys {
+        current = current.get(*key)?;
+    }
+
+    current
+        .as_i64()
+        .or_else(|| current.as_u64().and_then(|value| i64::try_from(value).ok()))
+        .or_else(|| current.as_f64().map(|value| value.round() as i64))
+}
+
+fn read_json_file<T: DeserializeOwned>(path: &Path) -> Option<T> {
+    let contents = fs::read_to_string(path).ok()?;
+    serde_json::from_str::<T>(&contents).ok()
+}
+
+fn merge_codexbar_cost_cache(
+    cache: CodexBarCostCache,
+    since: NaiveDate,
+    until: NaiveDate,
+    days: &mut BTreeMap<String, LocalDayUsage>,
+    models: &mut HashMap<String, LocalModelUsage>,
+) {
+    let mut row_costs: HashMap<(String, String), LocalDayUsage> = HashMap::new();
+    for file in cache.files.values() {
+        for row in &file.codex_rows {
+            if !day_key_in_range(&row.day, since, until) {
+                continue;
+            }
+            let model = normalize_codex_model(&row.model);
+            let cost = codex_cost_usd(&model, row.input, row.cached, row.output);
+            record_local_usage(
+                &mut row_costs,
+                &row.day,
+                &model,
+                row.input.saturating_add(row.output),
+                cost,
+            );
+        }
+    }
+
+    for (day_key, model_values) in cache.days {
+        if !day_key_in_range(&day_key, since, until) {
+            continue;
+        }
+        for (raw_model, packed) in model_values {
+            let model = normalize_codex_model(&raw_model);
+            let input = packed.first().copied().unwrap_or_default();
+            let cached = packed.get(1).copied().unwrap_or_default();
+            let output = packed.get(2).copied().unwrap_or_default();
+            let tokens = input.saturating_add(output).max(0);
+            let row_key = (day_key.clone(), model.clone());
+            let cost = row_costs
+                .get(&row_key)
+                .and_then(|usage| usage.cost_seen.then_some(usage.cost_usd))
+                .or_else(|| codex_cost_usd(&model, input, cached, output));
+
+            record_daily_usage(days, models, &day_key, &model, tokens, cost);
+        }
+    }
+}
+
+fn merge_pi_session_cost_cache(
+    cache: PiSessionCostCache,
+    since: NaiveDate,
+    until: NaiveDate,
+    days: &mut BTreeMap<String, LocalDayUsage>,
+    models: &mut HashMap<String, LocalModelUsage>,
+) {
+    let Some(provider_days) = cache.days_by_provider.get("codex") else {
+        return;
+    };
+
+    for (day_key, model_values) in provider_days {
+        if !day_key_in_range(day_key, since, until) {
+            continue;
+        }
+        for (raw_model, packed) in model_values {
+            let model = normalize_codex_model(raw_model);
+            let derived_tokens = packed
+                .input_tokens
+                .saturating_add(packed.cache_read_tokens)
+                .saturating_add(packed.cache_write_tokens)
+                .saturating_add(packed.output_tokens);
+            let tokens = packed.total_tokens.max(derived_tokens).max(0);
+            let has_complete_cached_cost = packed
+                .usage_sample_count
+                .is_some_and(|count| count > 0 && count == packed.cost_sample_count);
+            let cost = if has_complete_cached_cost {
+                Some(packed.cost_nanos as f64 / 1_000_000_000.0)
+            } else {
+                codex_cost_usd(
+                    &model,
+                    packed
+                        .input_tokens
+                        .saturating_add(packed.cache_read_tokens)
+                        .saturating_add(packed.cache_write_tokens),
+                    packed.cache_read_tokens,
+                    packed.output_tokens,
+                )
+            };
+
+            record_daily_usage(days, models, day_key, &model, tokens, cost);
+        }
+    }
+}
+
+fn record_local_usage(
+    row_costs: &mut HashMap<(String, String), LocalDayUsage>,
+    day_key: &str,
+    model: &str,
+    tokens: i64,
+    cost_usd: Option<f64>,
+) {
+    let usage = row_costs
+        .entry((day_key.to_string(), model.to_string()))
+        .or_default();
+    usage.total_tokens = usage.total_tokens.saturating_add(tokens.max(0));
+    if let Some(cost_usd) = finite_non_negative(cost_usd) {
+        usage.cost_usd += cost_usd;
+        usage.cost_seen = true;
+    }
+}
+
+fn record_daily_usage(
+    days: &mut BTreeMap<String, LocalDayUsage>,
+    models: &mut HashMap<String, LocalModelUsage>,
+    day_key: &str,
+    model: &str,
+    tokens: i64,
+    cost_usd: Option<f64>,
+) {
+    let tokens = tokens.max(0);
+    let day = days.entry(day_key.to_string()).or_default();
+    day.total_tokens = day.total_tokens.saturating_add(tokens);
+
+    let model_usage = models.entry(model.to_string()).or_default();
+    model_usage.total_tokens = model_usage.total_tokens.saturating_add(tokens);
+
+    if let Some(cost_usd) = finite_non_negative(cost_usd) {
+        day.cost_usd += cost_usd;
+        day.cost_seen = true;
+        model_usage.cost_usd += cost_usd;
+        model_usage.cost_seen = true;
+    }
+}
+
+fn finite_non_negative(value: Option<f64>) -> Option<f64> {
+    value.filter(|value| value.is_finite() && *value >= 0.0)
+}
+
+fn day_key_in_range(day_key: &str, since: NaiveDate, until: NaiveDate) -> bool {
+    NaiveDate::parse_from_str(day_key, "%Y-%m-%d")
+        .map(|date| date >= since && date <= until)
+        .unwrap_or(false)
+}
+
+fn top_local_model(models: &HashMap<String, LocalModelUsage>) -> Option<String> {
+    models
+        .iter()
+        .filter(|(_, usage)| usage.total_tokens > 0 || usage.cost_seen)
+        .max_by(
+            |(lhs_model, lhs), (rhs_model, rhs)| match (lhs.cost_seen, rhs.cost_seen) {
+                (true, true) => lhs
+                    .cost_usd
+                    .partial_cmp(&rhs.cost_usd)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| lhs.total_tokens.cmp(&rhs.total_tokens))
+                    .then_with(|| rhs_model.cmp(lhs_model)),
+                (true, false) => std::cmp::Ordering::Greater,
+                (false, true) => std::cmp::Ordering::Less,
+                (false, false) => lhs
+                    .total_tokens
+                    .cmp(&rhs.total_tokens)
+                    .then_with(|| rhs_model.cmp(lhs_model)),
+            },
+        )
+        .map(|(model, _)| model.clone())
+}
+
+fn normalize_codex_model(raw: &str) -> String {
+    let mut model = raw.trim();
+    if let Some(stripped) = model.strip_prefix("openai/") {
+        model = stripped;
+    }
+    if codex_model_pricing_exact(model).is_some() {
+        return model.to_string();
+    }
+    if let Some(base) = strip_codex_dated_suffix(model) {
+        if codex_model_pricing_exact(base).is_some() {
+            return base.to_string();
+        }
+    }
+    model.to_string()
+}
+
+fn strip_codex_dated_suffix(model: &str) -> Option<&str> {
+    let bytes = model.as_bytes();
+    if bytes.len() < 11 {
+        return None;
+    }
+    let start = bytes.len() - 11;
+    let suffix = &bytes[start..];
+    let matches = suffix[0] == b'-'
+        && suffix[1..5].iter().all(u8::is_ascii_digit)
+        && suffix[5] == b'-'
+        && suffix[6..8].iter().all(u8::is_ascii_digit)
+        && suffix[8] == b'-'
+        && suffix[9..11].iter().all(u8::is_ascii_digit);
+    matches.then_some(&model[..start])
+}
+
+fn codex_cost_usd(
+    model: &str,
+    input_tokens: i64,
+    cached_input_tokens: i64,
+    output_tokens: i64,
+) -> Option<f64> {
+    let pricing = codex_model_pricing_exact(&normalize_codex_model(model))?;
+    let input_tokens = input_tokens.max(0);
+    let cached = cached_input_tokens.max(0).min(input_tokens);
+    let non_cached = input_tokens.saturating_sub(cached);
+    let output_tokens = output_tokens.max(0);
+    let cached_rate = pricing.cache_rate.unwrap_or(pricing.input_rate);
+    let uses_long_context = pricing
+        .threshold_tokens
+        .is_some_and(|threshold| input_tokens > threshold);
+    let input_rate = if uses_long_context {
+        pricing
+            .input_rate_above_threshold
+            .unwrap_or(pricing.input_rate)
+    } else {
+        pricing.input_rate
+    };
+    let cached_input_rate = if uses_long_context {
+        pricing.cache_rate_above_threshold.unwrap_or(cached_rate)
+    } else {
+        cached_rate
+    };
+    let output_rate = if uses_long_context {
+        pricing
+            .output_rate_above_threshold
+            .unwrap_or(pricing.output_rate)
+    } else {
+        pricing.output_rate
+    };
+
+    Some(
+        non_cached as f64 * input_rate
+            + cached as f64 * cached_input_rate
+            + output_tokens as f64 * output_rate,
+    )
+}
+
+fn codex_model_pricing_exact(model: &str) -> Option<CodexModelPricing> {
+    let pricing = match model {
+        "gpt-5" | "gpt-5-codex" | "gpt-5.1" | "gpt-5.1-codex" | "gpt-5.1-codex-max" => {
+            CodexModelPricing {
+                input_rate: 1.25e-6,
+                output_rate: 1e-5,
+                cache_rate: Some(1.25e-7),
+                threshold_tokens: None,
+                input_rate_above_threshold: None,
+                output_rate_above_threshold: None,
+                cache_rate_above_threshold: None,
+            }
+        }
+        "gpt-5-mini" | "gpt-5.1-codex-mini" => CodexModelPricing {
+            input_rate: 2.5e-7,
+            output_rate: 2e-6,
+            cache_rate: Some(2.5e-8),
+            threshold_tokens: None,
+            input_rate_above_threshold: None,
+            output_rate_above_threshold: None,
+            cache_rate_above_threshold: None,
+        },
+        "gpt-5-nano" => CodexModelPricing {
+            input_rate: 5e-8,
+            output_rate: 4e-7,
+            cache_rate: Some(5e-9),
+            threshold_tokens: None,
+            input_rate_above_threshold: None,
+            output_rate_above_threshold: None,
+            cache_rate_above_threshold: None,
+        },
+        "gpt-5-pro" => CodexModelPricing {
+            input_rate: 1.5e-5,
+            output_rate: 1.2e-4,
+            cache_rate: None,
+            threshold_tokens: None,
+            input_rate_above_threshold: None,
+            output_rate_above_threshold: None,
+            cache_rate_above_threshold: None,
+        },
+        "gpt-5.2" | "gpt-5.2-codex" | "gpt-5.3-codex" => CodexModelPricing {
+            input_rate: 1.75e-6,
+            output_rate: 1.4e-5,
+            cache_rate: Some(1.75e-7),
+            threshold_tokens: None,
+            input_rate_above_threshold: None,
+            output_rate_above_threshold: None,
+            cache_rate_above_threshold: None,
+        },
+        "gpt-5.2-pro" => CodexModelPricing {
+            input_rate: 2.1e-5,
+            output_rate: 1.68e-4,
+            cache_rate: None,
+            threshold_tokens: None,
+            input_rate_above_threshold: None,
+            output_rate_above_threshold: None,
+            cache_rate_above_threshold: None,
+        },
+        "gpt-5.3-codex-spark" => CodexModelPricing {
+            input_rate: 0.0,
+            output_rate: 0.0,
+            cache_rate: Some(0.0),
+            threshold_tokens: None,
+            input_rate_above_threshold: None,
+            output_rate_above_threshold: None,
+            cache_rate_above_threshold: None,
+        },
+        "gpt-5.4" => CodexModelPricing {
+            input_rate: 2.5e-6,
+            output_rate: 1.5e-5,
+            cache_rate: Some(2.5e-7),
+            threshold_tokens: Some(272_000),
+            input_rate_above_threshold: Some(5e-6),
+            output_rate_above_threshold: Some(2.25e-5),
+            cache_rate_above_threshold: Some(5e-7),
+        },
+        "gpt-5.4-mini" => CodexModelPricing {
+            input_rate: 7.5e-7,
+            output_rate: 4.5e-6,
+            cache_rate: Some(7.5e-8),
+            threshold_tokens: None,
+            input_rate_above_threshold: None,
+            output_rate_above_threshold: None,
+            cache_rate_above_threshold: None,
+        },
+        "gpt-5.4-nano" => CodexModelPricing {
+            input_rate: 2e-7,
+            output_rate: 1.25e-6,
+            cache_rate: Some(2e-8),
+            threshold_tokens: None,
+            input_rate_above_threshold: None,
+            output_rate_above_threshold: None,
+            cache_rate_above_threshold: None,
+        },
+        "gpt-5.4-pro" | "gpt-5.5-pro" => CodexModelPricing {
+            input_rate: 3e-5,
+            output_rate: 1.8e-4,
+            cache_rate: None,
+            threshold_tokens: None,
+            input_rate_above_threshold: None,
+            output_rate_above_threshold: None,
+            cache_rate_above_threshold: None,
+        },
+        "gpt-5.5" => CodexModelPricing {
+            input_rate: 5e-6,
+            output_rate: 3e-5,
+            cache_rate: Some(5e-7),
+            threshold_tokens: Some(272_000),
+            input_rate_above_threshold: Some(1e-5),
+            output_rate_above_threshold: Some(4.5e-5),
+            cache_rate_above_threshold: Some(1e-6),
+        },
+        _ => return None,
+    };
+    Some(pricing)
+}
+
+fn codex_plan_display_text(raw: &str) -> Option<String> {
+    let normalized = raw.trim().to_lowercase();
+    if normalized.is_empty() {
+        return None;
+    }
+    let display = match normalized.as_str() {
+        "free" => "Free".to_string(),
+        "plus" => "Plus".to_string(),
+        "prolite" => "Pro 5x".to_string(),
+        "pro" => "Pro 20x".to_string(),
+        "team" => "Team".to_string(),
+        "enterprise" => "Enterprise".to_string(),
+        _ => raw
+            .split(|character: char| {
+                character == '_' || character == '-' || character.is_whitespace()
+            })
+            .filter(|part| !part.is_empty())
+            .map(|part| {
+                let mut characters = part.chars();
+                match characters.next() {
+                    Some(first) => {
+                        first.to_uppercase().collect::<String>()
+                            + &characters.as_str().to_lowercase()
+                    }
+                    None => String::new(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    };
+    Some(display)
 }
 
 fn rate_window_from_codex(window: &CodexUsageWindow) -> Option<RateWindowDetail> {
@@ -1518,6 +2431,8 @@ fn claude_provider_from_usage(response: ClaudeOAuthUsageResponse) -> ProviderUsa
 
     ProviderUsage {
         name: "Claude".to_string(),
+        account_email: None,
+        plan_text: None,
         session_left_percent: primary.as_ref().and_then(|window| window.percent_left),
         weekly_left_percent: secondary.as_ref().and_then(|window| window.percent_left),
         reset_text,
@@ -1715,26 +2630,32 @@ fn show_main_window(app: &tauri::AppHandle) {
         let _ = window.show();
         let _ = window.set_focus();
     }
+    refresh_tray_menu(app);
 }
 
 fn hide_main_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.hide();
     }
+    refresh_tray_menu(app);
 }
 
 fn toggle_main_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         match window.is_visible() {
             Ok(true) => {
-                let _ = window.hide();
+                hide_main_window(app);
             }
             Ok(false) | Err(_) => {
-                let _ = window.show();
-                let _ = window.set_focus();
+                show_main_window(app);
             }
         }
     }
+}
+
+#[tauri::command]
+fn hide_widget_window(app: AppHandle) {
+    hide_main_window(&app);
 }
 
 fn sync_tray_title_from_response(app: &AppHandle, response: &UsageSnapshotResponse) {
@@ -1961,12 +2882,45 @@ fn set_tray_usage_title(app: &AppHandle, title: Option<String>) {
     }
 }
 
-fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
-    let show = MenuItem::with_id(app, SHOW_WIDGET_ID, "Show Widget", true, None::<&str>)?;
-    let hide = MenuItem::with_id(app, HIDE_WIDGET_ID, "Hide Widget", true, None::<&str>)?;
+fn main_window_is_visible<R: Runtime>(app: &AppHandle<R>) -> bool {
+    app.get_webview_window("main")
+        .and_then(|window| window.is_visible().ok())
+        .unwrap_or(false)
+}
+
+fn toggle_widget_menu_label<R: Runtime>(app: &AppHandle<R>) -> &'static str {
+    if main_window_is_visible(app) {
+        "Hide Widget"
+    } else {
+        "Show Widget"
+    }
+}
+
+fn build_tray_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
+    let toggle = MenuItem::with_id(
+        app,
+        TOGGLE_WIDGET_ID,
+        toggle_widget_menu_label(app),
+        true,
+        None::<&str>,
+    )?;
     let separator = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, QUIT_ID, "Quit lilimit", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show, &hide, &separator, &quit])?;
+
+    Menu::with_items(app, &[&toggle, &separator, &quit])
+}
+
+fn refresh_tray_menu(app: &AppHandle) {
+    let Some(tray) = app.tray_by_id(TRAY_ID) else {
+        return;
+    };
+    if let Ok(menu) = build_tray_menu(app) {
+        let _ = tray.set_menu(Some(menu));
+    }
+}
+
+fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
+    let menu = build_tray_menu(app.handle())?;
 
     // macOS can show a text status item. GNOME support depends on the
     // shell/session: X11 and AppIndicator-capable setups are more predictable
@@ -1978,10 +2932,8 @@ fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
         .menu(&menu)
         .show_menu_on_left_click(true)
         .on_menu_event(|app, event| {
-            if event.id() == SHOW_WIDGET_ID {
-                show_main_window(app);
-            } else if event.id() == HIDE_WIDGET_ID {
-                hide_main_window(app);
+            if event.id() == TOGGLE_WIDGET_ID {
+                toggle_main_window(app);
             } else if event.id() == QUIT_ID {
                 app.exit(0);
             }
@@ -2012,7 +2964,7 @@ fn main() {
             // compositor level; X11 sessions are generally more predictable.
             let settings = read_widget_settings().unwrap_or_default();
             if let Some(window) = app.get_webview_window("main") {
-                apply_window_settings(&window, &settings);
+                apply_window_settings(&window, &settings, false);
             }
             setup_tray(app)?;
             Ok(())
@@ -2038,7 +2990,8 @@ fn main() {
             get_usage_snapshot,
             get_widget_settings,
             save_widget_settings,
-            show_settings_window
+            show_settings_window,
+            hide_widget_window
         ])
         .run(tauri::generate_context!())
         .expect("failed to run lilimit");
@@ -2051,6 +3004,8 @@ mod tests {
     #[test]
     fn maps_codex_oauth_usage_to_lilimit_provider() {
         let json = r#"{
+          "email": "dev@example.com",
+          "plan_type": "prolite",
           "rate_limit": {
             "primary_window": {
               "used_percent": 25,
@@ -2069,6 +3024,8 @@ mod tests {
         let provider = codex_provider_from_usage(response);
 
         assert_eq!(provider.name, "Codex");
+        assert_eq!(provider.account_email.as_deref(), Some("dev@example.com"));
+        assert_eq!(provider.plan_text.as_deref(), Some("Pro 5x"));
         assert_eq!(provider.session_left_percent, Some(75.0));
         assert_eq!(provider.weekly_left_percent, Some(60.0));
         assert_eq!(provider.credits_remaining, Some(12.5));
@@ -2103,6 +3060,8 @@ mod tests {
         let providers = vec![
             ProviderUsage {
                 name: "Codex".to_string(),
+                account_email: None,
+                plan_text: None,
                 session_left_percent: Some(71.0),
                 weekly_left_percent: None,
                 reset_text: String::new(),
@@ -2120,6 +3079,8 @@ mod tests {
             },
             ProviderUsage {
                 name: "Claude".to_string(),
+                account_email: None,
+                plan_text: None,
                 session_left_percent: Some(42.0),
                 weekly_left_percent: None,
                 reset_text: String::new(),
@@ -2154,6 +3115,8 @@ mod tests {
         let providers = vec![
             ProviderUsage {
                 name: "Codex".to_string(),
+                account_email: None,
+                plan_text: None,
                 session_left_percent: Some(71.0),
                 weekly_left_percent: None,
                 reset_text: String::new(),
@@ -2171,6 +3134,8 @@ mod tests {
             },
             ProviderUsage {
                 name: "Claude".to_string(),
+                account_email: None,
+                plan_text: None,
                 session_left_percent: Some(42.0),
                 weekly_left_percent: None,
                 reset_text: String::new(),
@@ -2199,5 +3164,22 @@ mod tests {
         assert_eq!(metrics.len(), 2);
         assert_eq!(metrics[0].used_percent, 29.0);
         assert_eq!(metrics[1].used_percent, 58.0);
+    }
+
+    #[test]
+    fn clamps_expanded_window_inside_screen_bounds() {
+        let position =
+            clamp_position_to_bounds(PhysicalPosition::new(600, 30), 360, 560, 0, 24, 668, 1200);
+
+        assert_eq!(position, PhysicalPosition::new(308, 30));
+    }
+
+    #[test]
+    fn anchors_right_edge_when_switching_display_modes() {
+        let expanded = right_edge_anchored_position(PhysicalPosition::new(600, 30), 280, 360);
+        let collapsed = right_edge_anchored_position(expanded, 360, 280);
+
+        assert_eq!(expanded, PhysicalPosition::new(520, 30));
+        assert_eq!(collapsed, PhysicalPosition::new(600, 30));
     }
 }

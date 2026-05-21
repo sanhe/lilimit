@@ -43,6 +43,7 @@ type TokenUsageSummary = {
   sessionTokens: number | null;
   last30DaysCostUSD: number | null;
   last30DaysTokens: number | null;
+  topModel: string | null;
 };
 
 type DailyUsagePoint = {
@@ -53,6 +54,8 @@ type DailyUsagePoint = {
 
 type ProviderUsage = {
   name: string;
+  accountEmail: string | null;
+  planText: string | null;
   sessionLeftPercent: number | null;
   weeklyLeftPercent: number | null;
   resetText: string;
@@ -224,6 +227,119 @@ function meterWidth(value: number | null, showsUsedPercent: boolean): number {
   }
 
   return showsUsedPercent ? 100 - value : value;
+}
+
+function formatDuration(ms: number): string {
+  const totalMinutes = Math.max(1, Math.ceil(ms / 60_000));
+  const days = Math.floor(totalMinutes / (24 * 60));
+  const hours = Math.floor((totalMinutes / 60) % 24);
+  const minutes = totalMinutes % 60;
+
+  if (days > 0) {
+    return hours > 0 ? `${days}d ${hours}h` : `${days}d`;
+  }
+  if (hours > 0) {
+    return minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`;
+  }
+  return `${totalMinutes}m`;
+}
+
+function rateWindowForRow(provider: ProviderUsage, row: UsageRow): RateWindowDetail | null {
+  switch (row.id) {
+    case "session":
+    case "primary":
+      return provider.primary;
+    case "weekly":
+    case "secondary":
+      return provider.secondary;
+    case "tertiary":
+      return provider.tertiary;
+    default:
+      return null;
+  }
+}
+
+function expectedUsedPercent(window: RateWindowDetail | null): number | null {
+  if (!window?.windowMinutes || !window.resetsAt) {
+    return null;
+  }
+
+  const resetMs = Date.parse(window.resetsAt);
+  if (!Number.isFinite(resetMs)) {
+    return null;
+  }
+
+  const totalMs = window.windowMinutes * 60_000;
+  if (!Number.isFinite(totalMs) || totalMs <= 0) {
+    return null;
+  }
+
+  const remainingMs = resetMs - Date.now();
+  const elapsedMs = Math.max(0, Math.min(totalMs, totalMs - remainingMs));
+  return Math.max(0, Math.min(100, (elapsedMs / totalMs) * 100));
+}
+
+function renderMeterMarkers(window: RateWindowDetail | null, showsUsedPercent: boolean): string {
+  if (!window) {
+    return "";
+  }
+
+  const thresholdMarkers = [50, 25]
+    .map((leftPercent) => (showsUsedPercent ? 100 - leftPercent : leftPercent))
+    .map(
+      (position) =>
+        `<span class="meter-marker threshold-marker" style="left: ${position}%"></span>`,
+    )
+    .join("");
+  const expectedUsed = expectedUsedPercent(window);
+  const paceMarker =
+    expectedUsed === null
+      ? ""
+      : `<span class="meter-marker pace-marker" style="left: ${
+          showsUsedPercent ? expectedUsed : 100 - expectedUsed
+        }%"></span>`;
+
+  return thresholdMarkers + paceMarker;
+}
+
+function rowPaceDetails(
+  window: RateWindowDetail | null,
+  percentLeft: number | null,
+): { pace: string | null; projection: string | null } {
+  const expectedUsed = expectedUsedPercent(window);
+  const actualUsed =
+    window?.usedPercent !== null && window?.usedPercent !== undefined
+      ? window.usedPercent
+      : percentLeft === null
+        ? null
+        : 100 - percentLeft;
+
+  if (expectedUsed === null || actualUsed === null || !window?.windowMinutes || !window.resetsAt) {
+    return { pace: null, projection: null };
+  }
+
+  const delta = Math.round(expectedUsed - actualUsed);
+  const pace =
+    Math.abs(delta) < 2
+      ? "On pace"
+      : delta > 0
+        ? `${delta}% in reserve`
+        : `${Math.abs(delta)}% over pace`;
+
+  const resetMs = Date.parse(window.resetsAt);
+  const totalMs = window.windowMinutes * 60_000;
+  const remainingMs = resetMs - Date.now();
+  const elapsedMs = Math.max(0, Math.min(totalMs, totalMs - remainingMs));
+  let projection = "Lasts until reset";
+
+  if (actualUsed > 0 && elapsedMs > 0) {
+    const msUntilEmpty = (elapsedMs / actualUsed) * (100 - actualUsed);
+    if (Number.isFinite(msUntilEmpty) && msUntilEmpty < remainingMs) {
+      projection = `Runs out in ${formatDuration(msUntilEmpty)}`;
+    }
+  }
+
+  return { pace, projection };
 }
 
 function sourceLabel(source: UsageSource | null): string {
@@ -401,13 +517,46 @@ function renderRefreshIcon(): string {
   `;
 }
 
+function renderDisplayModeIcon(): string {
+  if (currentSettings.displayMode === "simple") {
+    return `
+      <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+        <path d="M8 3H3v5"></path>
+        <path d="M3 3l7 7"></path>
+        <path d="M16 21h5v-5"></path>
+        <path d="M21 21l-7-7"></path>
+      </svg>
+    `;
+  }
+
+  return `
+    <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path d="M10 3v7H3"></path>
+      <path d="M3 10l7-7"></path>
+      <path d="M14 21v-7h7"></path>
+      <path d="M21 14l-7 7"></path>
+    </svg>
+  `;
+}
+
 function renderTitlebar(stale = false): string {
+  const nextMode = currentSettings.displayMode === "simple" ? "full" : "simple";
+  const toggleLabel =
+    currentSettings.displayMode === "simple" ? "Expand to full view" : "Collapse to mini view";
+
   return `
     <header class="titlebar" data-tauri-drag-region>
       <h1 data-tauri-drag-region>lilimit</h1>
       <div class="title-actions">
         ${stale ? '<span class="stale">stale</span>' : ""}
         <button class="icon-button refresh-button${refreshInProgress ? " refreshing" : ""}" type="button" aria-label="Refresh usage data" title="Refresh" ${refreshInProgress ? "disabled" : ""}>${renderRefreshIcon()}</button>
+        <button
+          class="icon-button display-mode-button"
+          type="button"
+          data-next-display-mode="${nextMode}"
+          aria-label="${toggleLabel}"
+          title="${toggleLabel}"
+        >${renderDisplayModeIcon()}</button>
         <button class="icon-button settings-button" type="button" aria-label="Widget settings" title="Settings">...</button>
         <button class="icon-button close-button" type="button" aria-label="Close lilimit" title="Close">x</button>
       </div>
@@ -453,22 +602,40 @@ function renderSimpleProvider(provider: ProviderUsage): string {
   `;
 }
 
-function renderFullUsageRow(row: UsageRow, color: string, showsUsedPercent: boolean): string {
+function renderFullUsageRow(
+  provider: ProviderUsage,
+  row: UsageRow,
+  color: string,
+  showsUsedPercent: boolean,
+): string {
   const percent = clampPercent(row.percentLeft);
   const width = meterWidth(percent, showsUsedPercent);
   const title = escapeHtml(row.title);
   const reset = row.resetText ? escapeHtml(row.resetText) : "";
+  const window = rateWindowForRow(provider, row);
+  const details = rowPaceDetails(window, percent);
+  const secondaryRows =
+    percent !== null || reset || details.pace || details.projection
+      ? `
+        <div class="row-details">
+          <span>${formatUsagePercent(percent, showsUsedPercent)}</span>
+          ${reset ? `<span>Resets ${reset}</span>` : "<span></span>"}
+          ${details.pace ? `<span>${escapeHtml(details.pace)}</span>` : "<span></span>"}
+          ${details.projection ? `<span>${escapeHtml(details.projection)}</span>` : "<span></span>"}
+        </div>
+      `
+      : "";
 
   return `
     <div class="full-usage-row">
       <div class="full-row-heading">
         <strong>${title}</strong>
-        <span>${formatUsagePercent(percent, showsUsedPercent)}</span>
       </div>
       <div class="meter full-meter">
         <div class="meter-fill" style="width: ${width}%; background: ${color}"></div>
+        ${renderMeterMarkers(window, showsUsedPercent)}
       </div>
-      ${reset ? `<div class="row-reset">Reset ${reset}</div>` : ""}
+      ${secondaryRows}
     </div>
   `;
 }
@@ -491,8 +658,41 @@ function renderTokenMetrics(tokenUsage: TokenUsageSummary | null): string {
     <div class="metrics">
       ${renderMetric("Today", formatUsd(tokenUsage.sessionCostUSD))}
       ${renderMetric("30d cost", formatUsd(tokenUsage.last30DaysCostUSD))}
-      ${renderMetric("Latest tokens", formatTokens(tokenUsage.sessionTokens))}
       ${renderMetric("30d tokens", formatTokens(tokenUsage.last30DaysTokens))}
+      ${renderMetric("Latest tokens", formatTokens(tokenUsage.sessionTokens))}
+    </div>
+  `;
+}
+
+function renderUsageNotes(tokenUsage: TokenUsageSummary | null): string {
+  if (!tokenUsage) {
+    return "";
+  }
+
+  return `
+    <div class="usage-notes">
+      ${tokenUsage.topModel ? `<p>Top model: ${escapeHtml(tokenUsage.topModel)}</p>` : ""}
+      <p>Estimated from local logs - may differ from your bill</p>
+    </div>
+  `;
+}
+
+function renderProviderMeta(provider: ProviderUsage): string {
+  const rows = [
+    provider.accountEmail,
+    provider.planText ??
+      (provider.creditsRemaining !== null
+        ? `${formatTokens(provider.creditsRemaining)} credits`
+        : null),
+  ].filter((value): value is string => Boolean(value));
+
+  if (rows.length === 0) {
+    return "";
+  }
+
+  return `
+    <div class="provider-meta">
+      ${rows.map((row) => `<span>${escapeHtml(row)}</span>`).join("")}
     </div>
   `;
 }
@@ -531,9 +731,10 @@ function renderFullProvider(provider: ProviderUsage, showsUsedPercent: boolean):
     ? `<span class="provider-state"${stateTitle}>stale</span>`
     : "";
   const usageRows = [
-    ...rows.map((row) => renderFullUsageRow(row, color, showsUsedPercent)),
+    ...rows.map((row) => renderFullUsageRow(provider, row, color, showsUsedPercent)),
     provider.codeReviewRemainingPercent !== null
       ? renderFullUsageRow(
+          provider,
           {
             id: "codeReview",
             title: "Code review",
@@ -553,18 +754,14 @@ function renderFullProvider(provider: ProviderUsage, showsUsedPercent: boolean):
           <h2>${name}</h2>
           <span>Updated ${formatAge(updatedAt)} ${stateBadge}</span>
         </div>
-        ${
-          provider.creditsRemaining !== null
-            ? `<span class="provider-badge">${escapeHtml(formatTokens(provider.creditsRemaining))} credits</span>`
-            : ""
-        }
+        ${renderProviderMeta(provider)}
       </div>
       <div class="full-rows">
         ${usageRows || '<p class="empty">No usage rows</p>'}
       </div>
       ${renderTokenMetrics(provider.tokenUsage)}
       ${renderHistory(provider.dailyUsage, color)}
-      ${provider.tokenUsage ? '<p class="usage-note">Estimated from local logs - may differ from your bill</p>' : ""}
+      ${renderUsageNotes(provider.tokenUsage)}
     </section>
   `;
 }
@@ -706,7 +903,7 @@ async function saveSettings(patch: Partial<WidgetSettings>): Promise<void> {
 
 function bindInteractions(): void {
   appRoot.querySelector(".close-button")?.addEventListener("click", () => {
-    void currentWindow.hide();
+    void invoke("hide_widget_window");
   });
 
   appRoot.querySelector(".settings-button")?.addEventListener("click", () => {
@@ -745,6 +942,14 @@ function bindInteractions(): void {
   appRoot.querySelectorAll(".refresh-button").forEach((button) => {
     button.addEventListener("click", () => {
       void refreshUsage(true);
+    });
+  });
+
+  appRoot.querySelectorAll<HTMLButtonElement>(".display-mode-button").forEach((button) => {
+    button.addEventListener("click", () => {
+      const displayMode: DisplayMode =
+        button.dataset.nextDisplayMode === "full" ? "full" : "simple";
+      void saveSettings({ displayMode });
     });
   });
 
