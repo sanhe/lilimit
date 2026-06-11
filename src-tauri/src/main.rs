@@ -3,13 +3,17 @@ use std::{
     env, fs,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    thread,
     time::Duration,
 };
 #[cfg(target_os = "macos")]
 use std::{
     io::Read,
     process::{Command, Stdio},
-    thread,
     time::Instant,
 };
 
@@ -37,6 +41,7 @@ const SIMPLE_HEIGHT: f64 = 140.0;
 const FULL_WIDTH: f64 = 360.0;
 const FULL_HEIGHT: f64 = 560.0;
 const COLLECTION_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const WINDOW_POSITION_FLUSH_DELAY: Duration = Duration::from_millis(500);
 const CLAUDE_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const CLAUDE_RATE_LIMIT_BASE_BACKOFF: Duration = Duration::from_secs(5 * 60);
 const CLAUDE_RATE_LIMIT_MAX_BACKOFF: Duration = Duration::from_secs(6 * 60 * 60);
@@ -254,14 +259,13 @@ struct UsageSnapshotResponse {
     path: String,
     source: Option<String>,
     updated_at: Option<String>,
-    shows_used_percent: bool,
     providers: Vec<ProviderUsage>,
     error: Option<String>,
 }
 
 fn usage_snapshot_candidate() -> Result<SnapshotCandidate, String> {
     Ok(SnapshotCandidate {
-        path: lilimit_config_dir()?.join(COLLECTED_USAGE_FILE),
+        path: collected_usage_snapshot_path()?,
         source: SnapshotSource::LilimitCollected,
     })
 }
@@ -272,18 +276,13 @@ fn lilimit_config_dir() -> Result<PathBuf, String> {
 
     #[cfg(target_os = "macos")]
     {
-        return Ok(home
+        Ok(home
             .join("Library")
             .join("Application Support")
-            .join("lilimit"));
+            .join("lilimit"))
     }
 
-    #[cfg(target_os = "linux")]
-    {
-        return Ok(home.join(".config").join("lilimit"));
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(target_os = "macos"))]
     {
         Ok(home.join(".config").join("lilimit"))
     }
@@ -308,12 +307,46 @@ fn read_widget_settings() -> Result<WidgetSettings, String> {
 
 fn write_widget_settings(settings: &WidgetSettings) -> Result<(), String> {
     let path = widget_settings_path()?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let contents = serde_json::to_string_pretty(settings).map_err(|error| error.to_string())?;
+    write_atomic(&path, &contents, 0o644)
+}
+
+// Write via a same-directory temp file and rename so a crash mid-write can
+// never leave a truncated file behind. This matters most for Codex's
+// auth.json, which the Codex CLI also reads and writes.
+fn write_atomic(path: &Path, contents: &str, default_mode: u32) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
+    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("file");
+    let temp_path = parent.join(format!(".{file_name}.{}.tmp", std::process::id()));
+    fs::write(&temp_path, contents).map_err(|error| error.to_string())?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(path)
+            .map(|metadata| metadata.permissions().mode() & 0o777)
+            .unwrap_or(default_mode);
+        if let Err(error) = fs::set_permissions(&temp_path, fs::Permissions::from_mode(mode)) {
+            let _ = fs::remove_file(&temp_path);
+            return Err(error.to_string());
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = default_mode;
     }
 
-    let contents = serde_json::to_string_pretty(settings).map_err(|error| error.to_string())?;
-    fs::write(path, contents).map_err(|error| error.to_string())
+    fs::rename(&temp_path, path).map_err(|error| {
+        let _ = fs::remove_file(&temp_path);
+        error.to_string()
+    })
 }
 
 fn collector_state_path() -> Result<PathBuf, String> {
@@ -333,12 +366,8 @@ fn read_collector_state() -> CollectorState {
 
 fn write_collector_state(state: &CollectorState) -> Result<(), String> {
     let path = collector_state_path()?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    }
-
     let contents = serde_json::to_string_pretty(state).map_err(|error| error.to_string())?;
-    fs::write(path, contents).map_err(|error| error.to_string())
+    write_atomic(&path, &contents, 0o644)
 }
 
 fn read_collected_usage_snapshot_file() -> Result<Option<UsageSnapshotFile>, String> {
@@ -363,10 +392,11 @@ fn save_widget_settings(
     app: AppHandle,
 ) -> Result<WidgetSettings, String> {
     let mut next = settings;
+    flush_pending_window_position(app.state::<Arc<PendingWindowPosition>>().inner());
     let existing = read_widget_settings().unwrap_or_default();
-    if next.window_position.is_none() {
-        next.window_position = existing.window_position;
-    }
+    // The backend owns the window position: the UI's copy goes stale whenever
+    // the user drags the widget, so positions echoed back here are ignored.
+    next.window_position = existing.window_position;
     let display_mode_changed = next.display_mode != existing.display_mode;
 
     write_widget_settings(&next)?;
@@ -403,6 +433,41 @@ fn persist_window_position(x: i32, y: i32) -> Result<(), String> {
     let mut settings = read_widget_settings().unwrap_or_default();
     settings.window_position = Some(WindowPosition { x, y });
     write_widget_settings(&settings)
+}
+
+#[derive(Default)]
+struct PendingWindowPosition {
+    position: Mutex<Option<WindowPosition>>,
+    flush_scheduled: AtomicBool,
+}
+
+// Move events arrive for every pixel of a drag; writing settings.json each
+// time would hammer the disk, so writes are coalesced behind a short delay.
+fn queue_window_position_persist(pending: &Arc<PendingWindowPosition>, x: i32, y: i32) {
+    if let Ok(mut slot) = pending.position.lock() {
+        *slot = Some(WindowPosition { x, y });
+    }
+    if pending.flush_scheduled.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    let pending = Arc::clone(pending);
+    thread::spawn(move || {
+        thread::sleep(WINDOW_POSITION_FLUSH_DELAY);
+        pending.flush_scheduled.store(false, Ordering::SeqCst);
+        flush_pending_window_position(&pending);
+    });
+}
+
+fn flush_pending_window_position(pending: &PendingWindowPosition) {
+    let position = pending
+        .position
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take());
+    if let Some(position) = position {
+        let _ = persist_window_position(position.x, position.y);
+    }
 }
 
 fn window_size(display_mode: DisplayMode) -> (f64, f64) {
@@ -586,7 +651,6 @@ fn get_usage_snapshot(app: AppHandle) -> UsageSnapshotResponse {
                 path: String::new(),
                 source: None,
                 updated_at: None,
-                shows_used_percent: false,
                 providers: Vec::new(),
                 error: Some(error),
             };
@@ -604,7 +668,6 @@ fn get_usage_snapshot(app: AppHandle) -> UsageSnapshotResponse {
                 path: path_text,
                 source: None,
                 updated_at: None,
-                shows_used_percent: false,
                 providers: Vec::new(),
                 error: None,
             };
@@ -617,7 +680,6 @@ fn get_usage_snapshot(app: AppHandle) -> UsageSnapshotResponse {
                 path: path_text,
                 source: Some(candidate.source.as_str().to_string()),
                 updated_at: None,
-                shows_used_percent: false,
                 providers: Vec::new(),
                 error: Some(error.to_string()),
             };
@@ -636,13 +698,12 @@ fn parse_lilimit_snapshot(
     path_text: &str,
     source: SnapshotSource,
 ) -> UsageSnapshotResponse {
-    match serde_json::from_str::<UsageSnapshotFile>(&contents) {
+    match serde_json::from_str::<UsageSnapshotFile>(contents) {
         Ok(snapshot) => UsageSnapshotResponse {
             status: "ready".to_string(),
             path: path_text.to_string(),
             source: Some(source.as_str().to_string()),
             updated_at: Some(snapshot.updated_at),
-            shows_used_percent: false,
             providers: snapshot
                 .providers
                 .into_iter()
@@ -655,7 +716,6 @@ fn parse_lilimit_snapshot(
             path: path_text.to_string(),
             source: Some(source.as_str().to_string()),
             updated_at: None,
-            shows_used_percent: false,
             providers: Vec::new(),
             error: Some(error.to_string()),
         },
@@ -922,40 +982,46 @@ async fn refresh_collected_usage_snapshot(
         .build()
         .map_err(|error| error.to_string())?;
 
-    let mut providers = Vec::new();
-    let mut errors = Vec::new();
     let mut collector_state = read_collector_state();
-
-    match fetch_codex_provider(&client).await {
-        Ok(provider) => providers.push(provider),
-        Err(error) => errors.push(format!("Codex: {error}")),
-    }
-
+    let previous_codex = previous_snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot_provider(snapshot, "Codex"))
+        .cloned();
     let previous_claude = previous_snapshot
         .as_ref()
         .and_then(|snapshot| snapshot_provider(snapshot, "Claude"))
         .cloned();
-    match collect_claude_provider(
+
+    let codex_result = collect_codex_provider(&client, previous_codex).await;
+    let claude_result = collect_claude_provider(
         &client,
         settings.keychain_access,
         previous_claude,
         &mut collector_state,
     )
-    .await
-    {
-        ClaudeCollectionResult::Provider(provider) => providers.push(provider),
-        ClaudeCollectionResult::Cached { provider, warning } => {
-            providers.push(provider);
-            errors.push(format!("Claude: {warning}"));
-        }
-        ClaudeCollectionResult::Unavailable(error) => {
-            if !providers.is_empty() || previous_snapshot.is_some() {
-                providers.push(unavailable_provider("Claude", error.clone()));
+    .await;
+    write_collector_state(&collector_state)?;
+
+    let any_available = [&codex_result, &claude_result]
+        .iter()
+        .any(|result| !matches!(result, ProviderCollectionResult::Unavailable(_)));
+    let mut providers = Vec::new();
+    let mut errors = Vec::new();
+    for (name, result) in [("Codex", codex_result), ("Claude", claude_result)] {
+        match result {
+            ProviderCollectionResult::Provider(provider) => providers.push(provider),
+            ProviderCollectionResult::Cached { provider, warning } => {
+                providers.push(provider);
+                errors.push(format!("{name}: {warning}"));
             }
-            errors.push(format!("Claude: {error}"));
+            ProviderCollectionResult::Unavailable(error) => {
+                if any_available || previous_snapshot.is_some() {
+                    providers.push(unavailable_provider(name, error.clone()));
+                }
+                errors.push(format!("{name}: {error}"));
+            }
         }
     }
-    write_collector_state(&collector_state)?;
 
     if providers.is_empty() {
         return Err(if errors.is_empty() {
@@ -993,11 +1059,8 @@ fn collected_usage_snapshot_path() -> Result<PathBuf, String> {
 
 fn write_collected_usage_snapshot(snapshot: &UsageSnapshotFile) -> Result<(), String> {
     let path = collected_usage_snapshot_path()?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    }
     let contents = serde_json::to_string_pretty(snapshot).map_err(|error| error.to_string())?;
-    fs::write(path, contents).map_err(|error| error.to_string())
+    write_atomic(&path, &contents, 0o644)
 }
 
 fn unavailable_provider(name: &str, error: String) -> ProviderUsage {
@@ -1053,7 +1116,7 @@ fn snapshot_provider<'a>(snapshot: &'a UsageSnapshotFile, name: &str) -> Option<
         .find(|provider| provider.name.eq_ignore_ascii_case(name))
 }
 
-enum ClaudeCollectionResult {
+enum ProviderCollectionResult {
     Provider(ProviderUsage),
     Cached {
         provider: ProviderUsage,
@@ -1062,19 +1125,41 @@ enum ClaudeCollectionResult {
     Unavailable(String),
 }
 
+async fn collect_codex_provider(
+    client: &reqwest::Client,
+    previous: Option<ProviderUsage>,
+) -> ProviderCollectionResult {
+    match fetch_codex_provider(client).await {
+        Ok(provider) => ProviderCollectionResult::Provider(provider),
+        Err(error) => {
+            let message = error.to_string();
+            if let Some(provider) = previous {
+                if should_preserve_cached_provider(&error) {
+                    return ProviderCollectionResult::Cached {
+                        provider: stale_provider(provider, message.clone()),
+                        warning: format!("{message}; showing cached data"),
+                    };
+                }
+            }
+
+            ProviderCollectionResult::Unavailable(message)
+        }
+    }
+}
+
 async fn collect_claude_provider(
     client: &reqwest::Client,
     keychain_access: KeychainAccess,
     previous: Option<ProviderUsage>,
     collector_state: &mut CollectorState,
-) -> ClaudeCollectionResult {
+) -> ProviderCollectionResult {
     if let Some(provider) = previous.as_ref() {
         if provider
             .updated_at
             .as_deref()
             .is_some_and(|updated_at| timestamp_is_within(updated_at, CLAUDE_REFRESH_INTERVAL))
         {
-            return ClaudeCollectionResult::Provider(provider.clone());
+            return ProviderCollectionResult::Provider(provider.clone());
         }
     }
 
@@ -1084,19 +1169,19 @@ async fn collect_claude_provider(
             reset_countdown_description(next_attempt_at)
         );
         if let Some(provider) = previous {
-            return ClaudeCollectionResult::Cached {
+            return ProviderCollectionResult::Cached {
                 provider: stale_provider(provider, warning.clone()),
                 warning,
             };
         }
-        return ClaudeCollectionResult::Unavailable(warning);
+        return ProviderCollectionResult::Unavailable(warning);
     }
 
     match fetch_claude_provider(client, keychain_access).await {
         Ok(provider) => {
             collector_state.claude_next_attempt_at = None;
             collector_state.claude_rate_limit_failures = 0;
-            ClaudeCollectionResult::Provider(provider)
+            ProviderCollectionResult::Provider(provider)
         }
         Err(error) => {
             if let UsageFetchError::RateLimited(retry_after) = &error {
@@ -1105,15 +1190,15 @@ async fn collect_claude_provider(
 
             let message = error.to_string();
             if let Some(provider) = previous {
-                if should_preserve_claude_provider(&error) {
-                    return ClaudeCollectionResult::Cached {
+                if should_preserve_cached_provider(&error) {
+                    return ProviderCollectionResult::Cached {
                         provider: stale_provider(provider, message.clone()),
                         warning: format!("{message}; showing cached data"),
                     };
                 }
             }
 
-            ClaudeCollectionResult::Unavailable(message)
+            ProviderCollectionResult::Unavailable(message)
         }
     }
 }
@@ -1156,21 +1241,23 @@ fn claude_backoff_duration(failures: u32) -> Duration {
     Duration::from_secs(seconds)
 }
 
-fn should_preserve_claude_provider(error: &UsageFetchError) -> bool {
+fn should_preserve_cached_provider(error: &UsageFetchError) -> bool {
     match error {
         UsageFetchError::AuthenticationRequired(_) => true,
         UsageFetchError::RateLimited(_) => true,
         UsageFetchError::Unauthorized => false,
-        UsageFetchError::Message(message) => is_transient_claude_error(message),
+        UsageFetchError::Message(message) => is_transient_fetch_error(message),
     }
 }
 
-fn is_transient_claude_error(message: &str) -> bool {
+fn is_transient_fetch_error(message: &str) -> bool {
     let lower = message.to_lowercase();
     lower.contains("timed out")
         || lower.contains("timeout")
         || lower.contains("connection")
         || lower.contains("network")
+        || lower.contains("dns")
+        || lower.contains("lookup")
         || lower.contains("http 408")
         || lower.contains("http 425")
         || lower.contains("http 429")
@@ -1180,28 +1267,23 @@ fn is_transient_claude_error(message: &str) -> bool {
         || lower.contains("http 504")
 }
 
-async fn fetch_codex_provider(client: &reqwest::Client) -> Result<ProviderUsage, String> {
-    let mut credentials = load_codex_credentials()?;
+async fn fetch_codex_provider(client: &reqwest::Client) -> Result<ProviderUsage, UsageFetchError> {
+    let mut credentials = load_codex_credentials().map_err(UsageFetchError::Message)?;
     if codex_credentials_need_refresh(&credentials) {
-        credentials = refresh_codex_credentials(client, &credentials)
-            .await
-            .map_err(|error| error.to_string())?;
-        save_codex_credentials(&credentials)?;
+        credentials = refresh_codex_credentials(client, &credentials).await?;
+        save_codex_credentials(&credentials).map_err(UsageFetchError::Message)?;
     }
 
     match fetch_codex_usage(client, &credentials).await {
         Ok(response) => Ok(codex_provider_from_usage(response)),
         Err(UsageFetchError::Unauthorized) if !credentials.refresh_token.is_empty() => {
-            let refreshed = refresh_codex_credentials(client, &credentials)
-                .await
-                .map_err(|error| error.to_string())?;
-            save_codex_credentials(&refreshed)?;
+            let refreshed = refresh_codex_credentials(client, &credentials).await?;
+            save_codex_credentials(&refreshed).map_err(UsageFetchError::Message)?;
             fetch_codex_usage(client, &refreshed)
                 .await
                 .map(codex_provider_from_usage)
-                .map_err(|error| error.to_string())
         }
-        Err(error) => Err(error.to_string()),
+        Err(error) => Err(error),
     }
 }
 
@@ -1339,7 +1421,7 @@ fn save_codex_credentials(credentials: &CodexCredentials) -> Result<(), String> 
     value["last_refresh"] = Value::String(now_iso_string());
 
     let serialized = serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?;
-    fs::write(&credentials.path, serialized).map_err(|error| error.to_string())
+    write_atomic(&credentials.path, &serialized, 0o600)
 }
 
 async fn fetch_codex_usage(
@@ -1604,26 +1686,42 @@ impl CodexTokenTotals {
     }
 }
 
+// CodexBar is a macOS menu bar app, so its cost caches only exist there.
+fn codexbar_cost_cache_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        Some(
+            home_dir()
+                .ok()?
+                .join("Library")
+                .join("Caches")
+                .join("CodexBar")
+                .join("cost-usage"),
+        )
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
 fn load_codex_local_token_usage() -> Option<(Option<TokenUsageSummary>, Vec<DailyUsagePoint>)> {
-    let cache_dir = home_dir()
-        .ok()?
-        .join("Library")
-        .join("Caches")
-        .join("CodexBar")
-        .join("cost-usage");
     let today = Local::now().date_naive();
     let since = today.checked_sub_days(Days::new(29)).unwrap_or(today);
     let mut days: BTreeMap<String, LocalDayUsage> = BTreeMap::new();
     let mut models: HashMap<String, LocalModelUsage> = HashMap::new();
 
-    if let Some(cache) = read_json_file::<CodexBarCostCache>(&cache_dir.join("codex-v7.json")) {
-        merge_codexbar_cost_cache(cache, since, today, &mut days, &mut models);
-    }
+    if let Some(cache_dir) = codexbar_cost_cache_dir() {
+        if let Some(cache) = read_json_file::<CodexBarCostCache>(&cache_dir.join("codex-v7.json")) {
+            merge_codexbar_cost_cache(cache, since, today, &mut days, &mut models);
+        }
 
-    if let Some(cache) =
-        read_json_file::<PiSessionCostCache>(&cache_dir.join("pi-sessions-v2.json"))
-    {
-        merge_pi_session_cost_cache(cache, since, today, &mut days, &mut models);
+        if let Some(cache) =
+            read_json_file::<PiSessionCostCache>(&cache_dir.join("pi-sessions-v2.json"))
+        {
+            merge_pi_session_cost_cache(cache, since, today, &mut days, &mut models);
+        }
     }
 
     if days.is_empty() {
@@ -1634,12 +1732,7 @@ fn load_codex_local_token_usage() -> Option<(Option<TokenUsageSummary>, Vec<Dail
 }
 
 fn load_claude_local_token_usage() -> Option<(Option<TokenUsageSummary>, Vec<DailyUsagePoint>)> {
-    let cache_dir = home_dir()
-        .ok()?
-        .join("Library")
-        .join("Caches")
-        .join("CodexBar")
-        .join("cost-usage");
+    let cache_dir = codexbar_cost_cache_dir()?;
     let today = Local::now().date_naive();
     let since = today.checked_sub_days(Days::new(29)).unwrap_or(today);
     let mut days: BTreeMap<String, LocalDayUsage> = BTreeMap::new();
@@ -1670,7 +1763,7 @@ fn summarize_local_token_usage(
     let total_tokens = days.values().map(|usage| usage.total_tokens).sum::<i64>();
     let cost_seen = days.values().any(|usage| usage.cost_seen);
     let total_cost = days.values().map(|usage| usage.cost_usd).sum::<f64>();
-    let top_model = top_local_model(&models);
+    let top_model = top_local_model(models);
     let daily_usage = days
         .iter()
         .map(|(day_key, usage)| DailyUsagePoint {
@@ -1702,7 +1795,9 @@ fn scan_codex_session_logs(
         return;
     };
     let mut files = Vec::new();
-    collect_codex_session_files(&root, since, until, &mut files);
+    // Sessions live at sessions/YYYY/MM/DD/rollout-*.jsonl; the depth cap just
+    // guards against symlink cycles.
+    collect_codex_session_files(&root, since, until, &mut files, 8);
     files.sort();
     for path in files {
         scan_codex_session_file(&path, since, until, days, models);
@@ -1714,7 +1809,11 @@ fn collect_codex_session_files(
     since: NaiveDate,
     until: NaiveDate,
     files: &mut Vec<PathBuf>,
+    max_depth: usize,
 ) {
+    let Some(remaining_depth) = max_depth.checked_sub(1) else {
+        return;
+    };
     let Ok(entries) = fs::read_dir(root) else {
         return;
     };
@@ -1722,7 +1821,7 @@ fn collect_codex_session_files(
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            collect_codex_session_files(&path, since, until, files);
+            collect_codex_session_files(&path, since, until, files, remaining_depth);
             continue;
         }
 
@@ -2562,7 +2661,13 @@ async fn fetch_claude_provider(
     client: &reqwest::Client,
     keychain_access: KeychainAccess,
 ) -> Result<ProviderUsage, UsageFetchError> {
-    let credentials = load_claude_credentials(keychain_access).map_err(UsageFetchError::Message)?;
+    // The Keychain path can wait up to 10s on a user prompt; keep that off
+    // the async runtime's worker threads.
+    let credentials =
+        tauri::async_runtime::spawn_blocking(move || load_claude_credentials(keychain_access))
+            .await
+            .map_err(|error| UsageFetchError::Message(error.to_string()))?
+            .map_err(UsageFetchError::Message)?;
     if claude_credentials_are_expired(&credentials) {
         // Claude Code owns these credentials. Direct refreshes can be rejected
         // by Anthropic for CLI-owned tokens, so let `claude` refresh them.
@@ -2683,6 +2788,7 @@ async fn fetch_claude_usage(
         .map_err(|error| UsageFetchError::Message(error.to_string()))
 }
 
+#[cfg(test)]
 fn claude_provider_from_usage(response: ClaudeOAuthUsageResponse) -> ProviderUsage {
     claude_provider_from_usage_with_local_usage(response, Some("Pro".to_string()), None)
 }
@@ -2700,44 +2806,41 @@ fn claude_provider_from_usage_with_local_usage(
     plan_text: Option<String>,
     local_usage: Option<(Option<TokenUsageSummary>, Vec<DailyUsagePoint>)>,
 ) -> ProviderUsage {
+    const WEEK_MINUTES: f64 = 7.0 * 24.0 * 60.0;
     let (token_usage, daily_usage) = local_usage.unwrap_or((None, Vec::new()));
-    let primary = response
+    let five_hour = response
         .five_hour
         .as_ref()
-        .and_then(|window| rate_window_from_claude(window, Some(5.0 * 60.0)))
-        .or_else(|| {
-            response
-                .seven_day
-                .as_ref()
-                .and_then(|window| rate_window_from_claude(window, Some(7.0 * 24.0 * 60.0)))
-        })
-        .or_else(|| {
-            response
-                .seven_day_oauth_apps
-                .as_ref()
-                .and_then(|window| rate_window_from_claude(window, Some(7.0 * 24.0 * 60.0)))
-        })
-        .or_else(|| {
-            response
-                .seven_day_sonnet
-                .as_ref()
-                .or(response.seven_day_opus.as_ref())
-                .and_then(|window| rate_window_from_claude(window, Some(7.0 * 24.0 * 60.0)))
-        });
-
-    let secondary = response
+        .and_then(|window| rate_window_from_claude(window, Some(5.0 * 60.0)));
+    let seven_day = response
         .seven_day
         .as_ref()
-        .and_then(|window| rate_window_from_claude(window, Some(7.0 * 24.0 * 60.0)));
-    let tertiary = response
+        .and_then(|window| rate_window_from_claude(window, Some(WEEK_MINUTES)));
+    let oauth_apps = response
+        .seven_day_oauth_apps
+        .as_ref()
+        .and_then(|window| rate_window_from_claude(window, Some(WEEK_MINUTES)));
+    let model_weekly = response
         .seven_day_sonnet
         .as_ref()
         .or(response.seven_day_opus.as_ref())
-        .and_then(|window| rate_window_from_claude(window, Some(7.0 * 24.0 * 60.0)));
+        .and_then(|window| rate_window_from_claude(window, Some(WEEK_MINUTES)));
+
+    // Each window fills at most one slot, and the labels follow the data that
+    // landed in the slot instead of assuming five_hour is always present.
+    let (primary, primary_title, secondary, tertiary) = if five_hour.is_some() {
+        (five_hour, "Session", seven_day, model_weekly)
+    } else if seven_day.is_some() {
+        (seven_day, "Weekly", None, model_weekly)
+    } else if oauth_apps.is_some() {
+        (oauth_apps, "Weekly", None, model_weekly)
+    } else {
+        (model_weekly, "Model weekly", None, None)
+    };
 
     let mut usage_rows = Vec::new();
     if let Some(window) = primary.as_ref() {
-        usage_rows.push(usage_row_from_window("primary", "Session", window));
+        usage_rows.push(usage_row_from_window("primary", primary_title, window));
     }
     if let Some(window) = secondary.as_ref() {
         usage_rows.push(usage_row_from_window("secondary", "Weekly", window));
@@ -3296,6 +3399,7 @@ fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
             if event.id() == TOGGLE_WIDGET_ID {
                 toggle_main_window(app);
             } else if event.id() == QUIT_ID {
+                flush_pending_window_position(app.state::<Arc<PendingWindowPosition>>().inner());
                 app.exit(0);
             }
         })
@@ -3323,6 +3427,7 @@ fn main() {
             // Registers Cmd+Shift+L on macOS and Ctrl+Shift+L on Linux.
             // Ubuntu GNOME Wayland may restrict global shortcuts at the
             // compositor level; X11 sessions are generally more predictable.
+            app.manage(Arc::new(PendingWindowPosition::default()));
             let settings = read_widget_settings().unwrap_or_default();
             if let Some(window) = app.get_webview_window("main") {
                 apply_window_settings(&window, &settings, false);
@@ -3342,7 +3447,8 @@ fn main() {
                     // Wayland compositors may delay or limit programmatic
                     // positioning; persisting the last reported value is still
                     // the best local-only behavior Tauri exposes.
-                    let _ = persist_window_position(position.x, position.y);
+                    let pending = window.app_handle().state::<Arc<PendingWindowPosition>>();
+                    queue_window_position_persist(pending.inner(), position.x, position.y);
                 }
             }
         })
@@ -3426,6 +3532,24 @@ mod tests {
                 && row.percent_left == Some(96.0)
                 && row.reset_text.as_deref() == Some("Monthly cap: \u{20ac}0.62 / \u{20ac}17.00")
         }));
+    }
+
+    #[test]
+    fn does_not_duplicate_seven_day_window_when_five_hour_is_missing() {
+        let json = r#"{
+          "seven_day": { "utilization": 20, "resets_at": "2100-01-08T00:00:00Z" },
+          "seven_day_sonnet": { "utilization": 27, "resets_at": "2100-01-08T00:00:00Z" }
+        }"#;
+        let response: ClaudeOAuthUsageResponse = serde_json::from_str(json).unwrap();
+        let provider = claude_provider_from_usage(response);
+
+        assert_eq!(provider.usage_rows.len(), 2);
+        assert_eq!(provider.usage_rows[0].id, "primary");
+        assert_eq!(provider.usage_rows[0].title, "Weekly");
+        assert_eq!(provider.usage_rows[1].id, "tertiary");
+        assert!(provider.secondary.is_none());
+        assert_eq!(provider.session_left_percent, Some(80.0));
+        assert_eq!(provider.weekly_left_percent, None);
     }
 
     #[test]

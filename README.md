@@ -4,7 +4,18 @@ lilimit is a tiny Tauri 2 desktop widget for Codex and Claude usage.
 
 By default, lilimit refreshes its own local snapshot: local CLI credentials are read from disk, usage APIs are called, and the result is written to lilimit's config directory.
 
-It does not integrate Hermes, does not read CodexBar data, does not import browser cookies, and does not scrape Chrome cookies or Chrome's Keychain storage.
+It does not integrate Hermes, does not import browser cookies, and does not scrape Chrome cookies or Chrome's Keychain storage.
+
+## Local data sources
+
+For token and cost history, lilimit reads local data that already exists on disk:
+
+- On macOS, it reuses CodexBar's cost caches (`~/Library/Caches/CodexBar/cost-usage`) when present.
+- For Codex, it otherwise falls back to scanning Codex CLI session logs in `~/.codex/sessions`.
+
+Codex credentials are read from `~/.codex/auth.json` (honoring `CODEX_HOME`). When the stored OAuth tokens are more than 8 days old or rejected, lilimit refreshes them against OpenAI's token endpoint and writes the result back to `~/.codex/auth.json` — the same file the Codex CLI maintains. The write is atomic (temp file + rename).
+
+Claude credentials are read from `~/.claude/.credentials.json`, or from the `LILIMIT_CLAUDE_OAUTH_TOKEN` environment variable if set. lilimit never refreshes or rewrites Claude credentials; when they expire, run `claude` to refresh them.
 
 ## Data file
 

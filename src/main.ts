@@ -78,7 +78,6 @@ type UsageSnapshot = {
   path: string;
   source: UsageSource | null;
   updatedAt: string | null;
-  showsUsedPercent: boolean;
   providers: ProviderUsage[];
   error: string | null;
 };
@@ -211,24 +210,8 @@ function formatPercent(value: number | null): string {
   return value === null ? "n/a" : `${value}%`;
 }
 
-function formatUsagePercent(value: number | null, showsUsedPercent: boolean): string {
-  if (value === null) {
-    return "n/a";
-  }
-
-  if (showsUsedPercent) {
-    return `${100 - value}% used`;
-  }
-
-  return `${value}% left`;
-}
-
-function meterWidth(value: number | null, showsUsedPercent: boolean): number {
-  if (value === null) {
-    return 0;
-  }
-
-  return showsUsedPercent ? 100 - value : value;
+function formatUsagePercent(value: number | null): string {
+  return value === null ? "n/a" : `${value}% left`;
 }
 
 function formatDuration(ms: number): string {
@@ -281,13 +264,12 @@ function expectedUsedPercent(window: RateWindowDetail | null): number | null {
   return Math.max(0, Math.min(100, (elapsedMs / totalMs) * 100));
 }
 
-function renderMeterMarkers(window: RateWindowDetail | null, showsUsedPercent: boolean): string {
+function renderMeterMarkers(window: RateWindowDetail | null): string {
   if (!window) {
     return "";
   }
 
   const thresholdMarkers = [50, 25]
-    .map((leftPercent) => (showsUsedPercent ? 100 - leftPercent : leftPercent))
     .map(
       (position) =>
         `<span class="meter-marker threshold-marker" style="left: ${position}%"></span>`,
@@ -297,9 +279,7 @@ function renderMeterMarkers(window: RateWindowDetail | null, showsUsedPercent: b
   const paceMarker =
     expectedUsed === null
       ? ""
-      : `<span class="meter-marker pace-marker" style="left: ${
-          showsUsedPercent ? expectedUsed : 100 - expectedUsed
-        }%"></span>`;
+      : `<span class="meter-marker pace-marker" style="left: ${100 - expectedUsed}%"></span>`;
 
   return thresholdMarkers + paceMarker;
 }
@@ -604,14 +584,9 @@ function renderSimpleProvider(provider: ProviderUsage): string {
   `;
 }
 
-function renderFullUsageRow(
-  provider: ProviderUsage,
-  row: UsageRow,
-  color: string,
-  showsUsedPercent: boolean,
-): string {
+function renderFullUsageRow(provider: ProviderUsage, row: UsageRow, color: string): string {
   const percent = clampPercent(row.percentLeft);
-  const width = meterWidth(percent, showsUsedPercent);
+  const width = percent ?? 0;
   const title = escapeHtml(row.title);
   const reset = row.resetText ? escapeHtml(row.resetText) : "";
   const window = rateWindowForRow(provider, row);
@@ -620,7 +595,7 @@ function renderFullUsageRow(
     percent !== null || reset || details.pace || details.projection
       ? `
         <div class="row-details">
-          <span>${formatUsagePercent(percent, showsUsedPercent)}</span>
+          <span>${formatUsagePercent(percent)}</span>
           ${reset ? `<span>Resets ${reset}</span>` : "<span></span>"}
           ${details.pace ? `<span>${escapeHtml(details.pace)}</span>` : "<span></span>"}
           ${details.projection ? `<span>${escapeHtml(details.projection)}</span>` : "<span></span>"}
@@ -635,7 +610,7 @@ function renderFullUsageRow(
       </div>
       <div class="meter full-meter">
         <div class="meter-fill" style="width: ${width}%; background: ${color}"></div>
-        ${renderMeterMarkers(window, showsUsedPercent)}
+        ${renderMeterMarkers(window)}
       </div>
       ${secondaryRows}
     </div>
@@ -710,7 +685,12 @@ function renderHistory(points: DailyUsagePoint[], color: string): string {
     return "";
   }
 
-  const values = visiblePoints.map((point) => point.costUSD ?? point.totalTokens ?? 0);
+  // Chart a single metric: mixing dollars and token counts in one scale
+  // makes the cost bars invisible next to million-token days.
+  const hasCost = visiblePoints.some((point) => point.costUSD !== null);
+  const values = visiblePoints.map((point) =>
+    hasCost ? (point.costUSD ?? 0) : (point.totalTokens ?? 0),
+  );
   const maxValue = Math.max(...values, 0);
 
   return `
@@ -727,51 +707,12 @@ function renderHistory(points: DailyUsagePoint[], color: string): string {
   `;
 }
 
-function parseAmountText(value: string): number | null {
-  const normalized = value.replace(/,/g, "");
-  const parsed = Number.parseFloat(normalized);
-  return Number.isFinite(parsed) ? parsed : null;
-}
-
-function formatMajorAmount(value: number): string {
-  return new Intl.NumberFormat(undefined, {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  }).format(value);
-}
-
-function normalizeExtraUsageResetText(resetText: string | null): string {
-  if (!resetText) {
-    return "";
-  }
-
-  const amountPattern = String.raw`([^\d-]*)(-?\d[\d,.]*)(\s*[A-Z]{3})?`;
-  const match = resetText.match(
-    new RegExp(String.raw`^(.*?:\s*)${amountPattern}\s*\/\s*${amountPattern}\s*$`),
-  );
-  if (!match) {
-    return resetText;
-  }
-
-  const [, label, usedPrefix, usedRaw, usedSuffix = "", limitPrefix, limitRaw, limitSuffix = ""] =
-    match;
-  const used = parseAmountText(usedRaw);
-  const limit = parseAmountText(limitRaw);
-  const hasCurrency = Boolean(
-    usedPrefix.trim() || usedSuffix.trim() || limitPrefix.trim() || limitSuffix.trim(),
-  );
-  if (used === null || limit === null || !hasCurrency || limit < 100) {
-    return resetText;
-  }
-
-  return `${label}${usedPrefix}${formatMajorAmount(used / 100)}${usedSuffix} / ${limitPrefix}${formatMajorAmount(limit / 100)}${limitSuffix}`;
-}
-
 function renderExtraUsageSection(row: UsageRow, color: string): string {
   const percentLeft = clampPercent(row.percentLeft);
   const usedPercent = percentLeft === null ? null : 100 - percentLeft;
   const width = usedPercent === null ? 0 : usedPercent;
-  const resetText = escapeHtml(normalizeExtraUsageResetText(row.resetText));
+  // The backend already reports amounts in major currency units.
+  const resetText = escapeHtml(row.resetText ?? "");
   const usedText = usedPercent === null ? "" : `${usedPercent}% used`;
 
   return `
@@ -815,7 +756,7 @@ function renderClaudeCostSummary(provider: ProviderUsage): string {
   `;
 }
 
-function renderFullProvider(provider: ProviderUsage, showsUsedPercent: boolean): string {
+function renderFullProvider(provider: ProviderUsage): string {
   const color = providerColor(provider.name);
   const rows = provider.usageRows.length > 0 ? provider.usageRows : fallbackRows(provider);
   const standardRows = rows.filter((row) => row.id !== "extra-usage");
@@ -828,7 +769,7 @@ function renderFullProvider(provider: ProviderUsage, showsUsedPercent: boolean):
     ? `<span class="provider-state"${stateTitle}>stale</span>`
     : "";
   const usageRows = [
-    ...standardRows.map((row) => renderFullUsageRow(provider, row, color, showsUsedPercent)),
+    ...standardRows.map((row) => renderFullUsageRow(provider, row, color)),
     provider.codeReviewRemainingPercent !== null
       ? renderFullUsageRow(
           provider,
@@ -839,7 +780,6 @@ function renderFullProvider(provider: ProviderUsage, showsUsedPercent: boolean):
             resetText: null,
           },
           color,
-          false,
         )
       : "",
   ].join("");
@@ -1014,7 +954,7 @@ function renderReady(snapshot: UsageSnapshot): string {
         <div class="full-content">
           ${
             visibleProviders.length > 0
-              ? visibleProviders.map((provider) => renderFullProvider(provider, snapshot.showsUsedPercent)).join("")
+              ? visibleProviders.map((provider) => renderFullProvider(provider)).join("")
               : `<p class="empty">No ${escapeHtml(fullTabLabel(currentFullTab))} data</p>`
           }
         </div>
@@ -1076,7 +1016,6 @@ function errorSnapshot(error: unknown): UsageSnapshot {
     path: "",
     source: null,
     updatedAt: null,
-    showsUsedPercent: false,
     providers: [],
     error: error instanceof Error ? error.message : String(error),
   };
@@ -1090,7 +1029,11 @@ async function saveSettings(patch: Partial<WidgetSettings>): Promise<void> {
 
   try {
     currentSettings = normalizeSettings(
-      await invoke<WidgetSettings>("save_widget_settings", { settings: nextSettings }),
+      await invoke<WidgetSettings>("save_widget_settings", {
+        // The backend owns the window position; echoing a cached value back
+        // could move the window to where it sat before the user dragged it.
+        settings: { ...nextSettings, windowPosition: null },
+      }),
     );
   } catch (error) {
     settingsError = error instanceof Error ? error.message : String(error);

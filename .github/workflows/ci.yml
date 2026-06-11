@@ -63,14 +63,44 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
 
-      - name: Cargo check
+      - name: Cargo fmt
         working-directory: src-tauri
-        run: cargo check --locked
+        run: cargo fmt --check
+
+      - name: Cargo clippy
+        working-directory: src-tauri
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Cargo build
         working-directory: src-tauri
         run: cargo build --locked
+
+      - name: Cargo test
+        working-directory: src-tauri
+        run: cargo test --locked
+
+  # The macOS-only code paths (Keychain read, CodexBar caches, tray text)
+  # never compile on the Linux job, so build and test them here too.
+  cargo-macos:
+    name: cargo (macos)
+    runs-on: macos-14
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cargo clippy
+        working-directory: src-tauri
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Cargo test
         working-directory: src-tauri
