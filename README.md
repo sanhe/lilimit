@@ -102,20 +102,70 @@ make build
 make tauri-build
 ```
 
-## Run on Ubuntu
+## Install on Ubuntu
 
-Install the Tauri Linux prerequisites for your Ubuntu release, then run:
+Download the latest Ubuntu artifacts from the [GitHub release page](https://github.com/sanhe/lilimit/releases).
+
+Prefer the `.deb` package on Ubuntu:
+
+```sh
+sudo apt install ./lilimit_*_amd64.deb
+lilimit
+```
+
+If you use the AppImage fallback:
+
+```sh
+chmod +x lilimit_*.AppImage
+./lilimit_*.AppImage
+```
+
+Before launching lilimit, sign in with the CLIs you want it to read:
+
+```sh
+codex
+claude
+```
+
+Lilimit reads Codex credentials from `~/.codex/auth.json` and Claude credentials from `~/.claude/.credentials.json`. Its own Ubuntu data lives in `~/.config/lilimit`.
+
+## Build on Ubuntu
+
+Install Node.js, pnpm, and Rust first. Then install the Tauri Linux prerequisites:
+
+```sh
+sudo apt update
+sudo apt install -y \
+  libwebkit2gtk-4.1-dev \
+  build-essential \
+  curl \
+  wget \
+  file \
+  libgtk-3-dev \
+  libxdo-dev \
+  libssl-dev \
+  libayatana-appindicator3-dev \
+  librsvg2-dev \
+  patchelf \
+  pkg-config
+```
+
+Then run the app from source:
 
 ```sh
 pnpm install
 pnpm tauri:dev
 ```
 
-Build:
+Build Ubuntu packages:
 
 ```sh
-pnpm tauri:build
+pnpm tauri build --bundles deb,appimage
 ```
+
+The generated artifacts are written under `src-tauri/target/release/bundle/deb` and `src-tauri/target/release/bundle/appimage`.
+
+The `release-linux` GitHub Actions workflow builds these artifacts on Ubuntu 22.04 and attaches them to a draft GitHub release. Run it manually from Actions, or push a tag like `lilimit-v0.1.0`, then publish the draft after checking the assets.
 
 The same Makefile shortcuts work on Ubuntu:
 
