@@ -868,6 +868,30 @@ struct CodexCreditDetails {
     balance: Option<f64>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct OptionalClaudeOAuthWindow {
+    value: Option<ClaudeOAuthWindow>,
+    present: bool,
+}
+
+impl<'de> Deserialize<'de> for OptionalClaudeOAuthWindow {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(Self {
+            value: Option::<ClaudeOAuthWindow>::deserialize(deserializer)?,
+            present: true,
+        })
+    }
+}
+
+impl OptionalClaudeOAuthWindow {
+    fn as_ref(&self) -> Option<&ClaudeOAuthWindow> {
+        self.value.as_ref()
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ClaudeOAuthUsageResponse {
     #[serde(default)]
@@ -881,58 +905,64 @@ struct ClaudeOAuthUsageResponse {
     #[serde(default)]
     seven_day_sonnet: Option<ClaudeOAuthWindow>,
     #[serde(default)]
-    seven_day_design: Option<ClaudeOAuthWindow>,
+    seven_day_design: OptionalClaudeOAuthWindow,
     #[serde(default)]
-    seven_day_claude_design: Option<ClaudeOAuthWindow>,
+    seven_day_claude_design: OptionalClaudeOAuthWindow,
     #[serde(default)]
-    claude_design: Option<ClaudeOAuthWindow>,
+    claude_design: OptionalClaudeOAuthWindow,
     #[serde(default)]
-    design: Option<ClaudeOAuthWindow>,
+    design: OptionalClaudeOAuthWindow,
     #[serde(default)]
-    seven_day_omelette: Option<ClaudeOAuthWindow>,
+    seven_day_omelette: OptionalClaudeOAuthWindow,
     #[serde(default)]
-    omelette: Option<ClaudeOAuthWindow>,
+    omelette: OptionalClaudeOAuthWindow,
     #[serde(default)]
-    omelette_promotional: Option<ClaudeOAuthWindow>,
+    omelette_promotional: OptionalClaudeOAuthWindow,
     #[serde(default)]
-    seven_day_routines: Option<ClaudeOAuthWindow>,
+    seven_day_routines: OptionalClaudeOAuthWindow,
     #[serde(default)]
-    seven_day_claude_routines: Option<ClaudeOAuthWindow>,
+    seven_day_claude_routines: OptionalClaudeOAuthWindow,
     #[serde(default)]
-    claude_routines: Option<ClaudeOAuthWindow>,
+    claude_routines: OptionalClaudeOAuthWindow,
     #[serde(default)]
-    routines: Option<ClaudeOAuthWindow>,
+    routines: OptionalClaudeOAuthWindow,
     #[serde(default)]
-    routine: Option<ClaudeOAuthWindow>,
+    routine: OptionalClaudeOAuthWindow,
     #[serde(default)]
-    seven_day_cowork: Option<ClaudeOAuthWindow>,
+    seven_day_cowork: OptionalClaudeOAuthWindow,
     #[serde(default)]
-    cowork: Option<ClaudeOAuthWindow>,
+    cowork: OptionalClaudeOAuthWindow,
     #[serde(default)]
     extra_usage: Option<ClaudeExtraUsage>,
 }
 
 impl ClaudeOAuthUsageResponse {
-    fn design_window(&self) -> Option<&ClaudeOAuthWindow> {
-        self.seven_day_design
-            .as_ref()
-            .or(self.seven_day_claude_design.as_ref())
-            .or(self.claude_design.as_ref())
-            .or(self.design.as_ref())
-            .or(self.seven_day_omelette.as_ref())
-            .or(self.omelette.as_ref())
-            .or(self.omelette_promotional.as_ref())
+    fn design_window(&self) -> Option<&OptionalClaudeOAuthWindow> {
+        [
+            &self.seven_day_design,
+            &self.seven_day_claude_design,
+            &self.claude_design,
+            &self.design,
+            &self.seven_day_omelette,
+            &self.omelette,
+            &self.omelette_promotional,
+        ]
+        .into_iter()
+        .find(|window| window.present)
     }
 
-    fn routines_window(&self) -> Option<&ClaudeOAuthWindow> {
-        self.seven_day_routines
-            .as_ref()
-            .or(self.seven_day_claude_routines.as_ref())
-            .or(self.claude_routines.as_ref())
-            .or(self.routines.as_ref())
-            .or(self.routine.as_ref())
-            .or(self.seven_day_cowork.as_ref())
-            .or(self.cowork.as_ref())
+    fn routines_window(&self) -> Option<&OptionalClaudeOAuthWindow> {
+        [
+            &self.seven_day_routines,
+            &self.seven_day_claude_routines,
+            &self.claude_routines,
+            &self.routines,
+            &self.routine,
+            &self.seven_day_cowork,
+            &self.cowork,
+        ]
+        .into_iter()
+        .find(|window| window.present)
     }
 }
 
@@ -2823,8 +2853,15 @@ fn claude_provider_from_usage_with_local_usage(
     let model_weekly = response
         .seven_day_sonnet
         .as_ref()
-        .or(response.seven_day_opus.as_ref())
-        .and_then(|window| rate_window_from_claude(window, Some(WEEK_MINUTES)));
+        .and_then(|window| rate_window_from_claude(window, Some(WEEK_MINUTES)))
+        .map(|window| ("Sonnet", window))
+        .or_else(|| {
+            response
+                .seven_day_opus
+                .as_ref()
+                .and_then(|window| rate_window_from_claude(window, Some(WEEK_MINUTES)))
+                .map(|window| ("Opus", window))
+        });
 
     // Each window fills at most one slot, and the labels follow the data that
     // landed in the slot instead of assuming five_hour is always present.
@@ -2834,8 +2871,10 @@ fn claude_provider_from_usage_with_local_usage(
         (seven_day, "Weekly", None, model_weekly)
     } else if oauth_apps.is_some() {
         (oauth_apps, "Weekly", None, model_weekly)
+    } else if let Some((title, window)) = model_weekly {
+        (Some(window), title, None, None)
     } else {
-        (model_weekly, "Model weekly", None, None)
+        (None, "Session", None, None)
     };
 
     let mut usage_rows = Vec::new();
@@ -2845,18 +2884,18 @@ fn claude_provider_from_usage_with_local_usage(
     if let Some(window) = secondary.as_ref() {
         usage_rows.push(usage_row_from_window("secondary", "Weekly", window));
     }
-    if let Some(window) = tertiary.as_ref() {
-        usage_rows.push(usage_row_from_window("tertiary", "Model weekly", window));
+    if let Some((title, window)) = tertiary.as_ref() {
+        usage_rows.push(usage_row_from_window("tertiary", title, window));
     }
     if let Some(window) = response
         .design_window()
-        .and_then(|window| rate_window_from_claude(window, Some(7.0 * 24.0 * 60.0)))
+        .and_then(|window| rate_window_from_optional_claude(window, Some(WEEK_MINUTES)))
     {
         usage_rows.push(usage_row_from_window("claude-design", "Designs", &window));
     }
     if let Some(window) = response
         .routines_window()
-        .and_then(|window| rate_window_from_claude(window, Some(7.0 * 24.0 * 60.0)))
+        .and_then(|window| rate_window_from_optional_claude(window, Some(WEEK_MINUTES)))
     {
         usage_rows.push(usage_row_from_window(
             "claude-routines",
@@ -2884,7 +2923,7 @@ fn claude_provider_from_usage_with_local_usage(
         usage_rows,
         primary,
         secondary,
-        tertiary,
+        tertiary: tertiary.map(|(_, window)| window),
         credits_remaining: None,
         code_review_remaining_percent: None,
         token_usage,
@@ -2905,6 +2944,21 @@ fn rate_window_from_claude(
         window_minutes,
         reset_at,
     ))
+}
+
+fn rate_window_from_optional_claude(
+    window: &OptionalClaudeOAuthWindow,
+    window_minutes: Option<f64>,
+) -> Option<RateWindowDetail> {
+    if let Some(value) = window.as_ref() {
+        if let Some(detail) = rate_window_from_claude(value, window_minutes) {
+            return Some(detail);
+        }
+    }
+
+    window
+        .present
+        .then(|| rate_window_detail_from_parts(0.0, window_minutes, None))
 }
 
 fn extra_usage_window(extra: &ClaudeExtraUsage) -> Option<RateWindowDetail> {
@@ -3526,6 +3580,10 @@ mod tests {
         assert!(provider
             .usage_rows
             .iter()
+            .any(|row| row.id == "tertiary" && row.title == "Sonnet"));
+        assert!(provider
+            .usage_rows
+            .iter()
             .any(|row| row.id == "claude-design" && row.percent_left == Some(100.0)));
         assert!(provider.usage_rows.iter().any(|row| {
             row.id == "extra-usage"
@@ -3547,9 +3605,30 @@ mod tests {
         assert_eq!(provider.usage_rows[0].id, "primary");
         assert_eq!(provider.usage_rows[0].title, "Weekly");
         assert_eq!(provider.usage_rows[1].id, "tertiary");
+        assert_eq!(provider.usage_rows[1].title, "Sonnet");
         assert!(provider.secondary.is_none());
         assert_eq!(provider.session_left_percent, Some(80.0));
         assert_eq!(provider.weekly_left_percent, None);
+    }
+
+    #[test]
+    fn maps_null_claude_extra_windows_to_available_rows() {
+        let json = r#"{
+          "five_hour": { "utilization": 9, "resets_at": "2100-01-01T00:00:00Z" },
+          "seven_day_omelette": null,
+          "seven_day_cowork": null
+        }"#;
+        let response: ClaudeOAuthUsageResponse = serde_json::from_str(json).unwrap();
+        let provider = claude_provider_from_usage(response);
+
+        assert!(provider.usage_rows.iter().any(|row| {
+            row.id == "claude-design" && row.title == "Designs" && row.percent_left == Some(100.0)
+        }));
+        assert!(provider.usage_rows.iter().any(|row| {
+            row.id == "claude-routines"
+                && row.title == "Daily Routines"
+                && row.percent_left == Some(100.0)
+        }));
     }
 
     #[test]

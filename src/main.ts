@@ -626,17 +626,34 @@ function renderMetric(title: string, value: string): string {
   `;
 }
 
-function renderTokenMetrics(tokenUsage: TokenUsageSummary | null): string {
+function localDayKey(date = new Date()): string {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function latestDailyUsage(points: DailyUsagePoint[]): DailyUsagePoint | null {
+  return points.length > 0 ? points[points.length - 1] : null;
+}
+
+function renderTokenMetrics(provider: ProviderUsage): string {
+  const tokenUsage = provider.tokenUsage;
   if (!tokenUsage) {
     return "";
   }
 
+  const latest = latestDailyUsage(provider.dailyUsage);
+  const latestCost = latest?.costUSD ?? tokenUsage.sessionCostUSD;
+  const latestTokens = latest?.totalTokens ?? tokenUsage.sessionTokens;
+  const latestCostTitle = latest?.dayKey === localDayKey() ? "Today" : "Latest cost";
+
   return `
     <div class="metrics">
-      ${renderMetric("Today", formatUsd(tokenUsage.sessionCostUSD))}
+      ${renderMetric(latestCostTitle, formatUsd(latestCost))}
       ${renderMetric("30d cost", formatUsd(tokenUsage.last30DaysCostUSD))}
       ${renderMetric("30d tokens", formatTokens(tokenUsage.last30DaysTokens))}
-      ${renderMetric("Latest tokens", formatTokens(tokenUsage.sessionTokens))}
+      ${renderMetric("Latest tokens", formatTokens(latestTokens))}
     </div>
   `;
 }
@@ -646,10 +663,13 @@ function renderUsageNotes(provider: ProviderUsage): string {
     return "";
   }
   const tokenUsage = provider.tokenUsage;
-  const isClaude = provider.name.toLowerCase() === "claude";
-  const estimateText = isClaude
-    ? "Estimated from local Claude logs at API rates; token totals include cache"
-    : "Estimated from local logs - may differ from your bill";
+  const providerName = provider.name.toLowerCase();
+  const estimateText =
+    providerName === "claude"
+      ? "Estimated from local Claude logs at API rates; token totals include cache"
+      : providerName === "codex"
+        ? "Estimated from local Codex logs at API rates; token totals include cache"
+        : "Estimated from local logs at API rates; token totals include cache";
 
   return `
     <div class="usage-notes">
@@ -744,11 +764,16 @@ function renderClaudeCostSummary(provider: ProviderUsage): string {
   }
 
   const tokenUsage = provider.tokenUsage;
+  const latest = latestDailyUsage(provider.dailyUsage);
+  const latestCost = latest?.costUSD ?? tokenUsage.sessionCostUSD;
+  const latestTokens = latest?.totalTokens ?? tokenUsage.sessionTokens;
+  const latestLabel = latest?.dayKey === localDayKey() ? "Today" : "Latest";
+
   return `
     <div class="usage-section cost-summary">
       <div>
         <h3>Cost</h3>
-        <p>Today: ${formatCostAndTokens(tokenUsage.sessionCostUSD, tokenUsage.sessionTokens)}</p>
+        <p>${latestLabel}: ${formatCostAndTokens(latestCost, latestTokens)}</p>
         <p>Last 30 days: ${formatCostAndTokens(tokenUsage.last30DaysCostUSD, tokenUsage.last30DaysTokens)}</p>
       </div>
       <span class="cost-chevron" aria-hidden="true">&rsaquo;</span>
@@ -796,7 +821,7 @@ function renderFullProvider(provider: ProviderUsage): string {
       <div class="full-rows">
         ${usageRows || '<p class="empty">No usage rows</p>'}
       </div>
-      ${renderTokenMetrics(provider.tokenUsage)}
+      ${renderTokenMetrics(provider)}
       ${renderHistory(provider.dailyUsage, color)}
       ${renderUsageNotes(provider)}
       ${extraUsageRows.map((row) => renderExtraUsageSection(row, color)).join("")}
