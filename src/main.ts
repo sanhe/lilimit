@@ -21,6 +21,7 @@ type WidgetSettings = {
   background: WidgetBackground;
   keychainAccess: KeychainAccess;
   toolbarDisplay: ToolbarDisplay;
+  scale: number;
   windowPosition: WindowPosition | null;
 };
 
@@ -84,11 +85,18 @@ type UsageSnapshot = {
 
 const REFRESH_MS = 5 * 60 * 1000;
 const STALE_MS = 15 * 60 * 1000;
+// Mirrors the MIN_SCALE/MAX_SCALE/step the Rust backend clamps to; the actual
+// scaling is applied natively (window resize + webview zoom) by the backend.
+const MIN_SCALE = 0.8;
+const MAX_SCALE = 2;
+const SCALE_STEP = 0.1;
+const DEFAULT_SCALE = 1;
 const DEFAULT_SETTINGS: WidgetSettings = {
   displayMode: "simple",
   background: "dark",
   keychainAccess: "off",
   toolbarDisplay: "bars",
+  scale: DEFAULT_SCALE,
   windowPosition: null,
 };
 const currentWindow = getCurrentWindow();
@@ -107,6 +115,17 @@ let settingsError: string | null = null;
 let collectionError: string | null = null;
 let refreshInProgress = false;
 let currentFullTab: FullTab = "overview";
+
+// Snap to one-decimal steps and clamp; keeps stored values aligned with the
+// stepper so the readout always shows clean percentages.
+function clampScale(value: number | null | undefined): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return DEFAULT_SCALE;
+  }
+
+  const snapped = Math.round(value / SCALE_STEP) * SCALE_STEP;
+  return Math.min(MAX_SCALE, Math.max(MIN_SCALE, Math.round(snapped * 100) / 100));
+}
 
 function clampPercent(value: number | null): number | null {
   if (value === null || !Number.isFinite(value)) {
@@ -407,8 +426,13 @@ function normalizeSettings(settings: Partial<WidgetSettings> | null): WidgetSett
     background: settings?.background === "light" ? "light" : "dark",
     keychainAccess: settings?.keychainAccess === "allow" ? "allow" : "off",
     toolbarDisplay: settings?.toolbarDisplay === "text" ? "text" : "bars",
+    scale: clampScale(settings?.scale),
     windowPosition: settings?.windowPosition ?? null,
   };
+}
+
+function formatScalePercent(scale: number): string {
+  return `${Math.round(clampScale(scale) * 100)}%`;
 }
 
 function fallbackRows(provider: ProviderUsage): UsageRow[] {
@@ -440,6 +464,9 @@ function renderSettingsPanel(): string {
   const background = currentSettings.background;
   const keychainAccess = currentSettings.keychainAccess;
   const toolbarDisplay = currentSettings.toolbarDisplay;
+  const scale = clampScale(currentSettings.scale);
+  const atMin = scale <= MIN_SCALE + 1e-6;
+  const atMax = scale >= MAX_SCALE - 1e-6;
 
   return `
     <div class="settings-panel">
@@ -448,6 +475,14 @@ function renderSettingsPanel(): string {
         <div class="segmented">
           <button type="button" data-display-mode="simple" class="${mode === "simple" ? "active" : ""}">Simple</button>
           <button type="button" data-display-mode="full" class="${mode === "full" ? "active" : ""}">Full</button>
+        </div>
+      </div>
+      <div class="setting-group">
+        <span>Scale</span>
+        <div class="stepper" role="group" aria-label="Widget scale">
+          <button type="button" class="stepper-button" data-scale-step="down" aria-label="Decrease scale" ${atMin ? "disabled" : ""}>&minus;</button>
+          <span class="stepper-value" aria-live="polite">${formatScalePercent(scale)}</span>
+          <button type="button" class="stepper-button" data-scale-step="up" aria-label="Increase scale" ${atMax ? "disabled" : ""}>+</button>
         </div>
       </div>
       <div class="setting-group">
@@ -1105,6 +1140,16 @@ function bindInteractions(): void {
     });
   });
 
+  appRoot.querySelectorAll<HTMLButtonElement>("[data-scale-step]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const direction = button.dataset.scaleStep === "down" ? -1 : 1;
+      const next = clampScale(clampScale(currentSettings.scale) + direction * SCALE_STEP);
+      if (next !== clampScale(currentSettings.scale)) {
+        void saveSettings({ scale: next });
+      }
+    });
+  });
+
   appRoot.querySelectorAll(".refresh-button").forEach((button) => {
     button.addEventListener("click", () => {
       void refreshUsage(true);
@@ -1231,6 +1276,16 @@ async function initialize(): Promise<void> {
   }
 
   renderLoading();
+
+  // Re-assert the saved scale now that the webview has loaded. The backend also
+  // applies it at startup, but on some WebKitGTK builds a zoom set before the
+  // initial page load does not stick; re-applying here is idempotent.
+  try {
+    await invoke("reapply_widget_scale");
+  } catch {
+    // Non-fatal: the startup zoom from the backend remains in effect.
+  }
+
   await refreshUsage();
   window.setInterval(() => {
     void refreshUsage();

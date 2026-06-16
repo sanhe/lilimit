@@ -40,6 +40,10 @@ const SIMPLE_WIDTH: f64 = 280.0;
 const SIMPLE_HEIGHT: f64 = 140.0;
 const FULL_WIDTH: f64 = 360.0;
 const FULL_HEIGHT: f64 = 560.0;
+const MIN_SCALE: f64 = 0.8;
+const MAX_SCALE: f64 = 2.0;
+const SCALE_STEP: f64 = 0.1;
+const DEFAULT_SCALE: f64 = 1.0;
 const COLLECTION_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const WINDOW_POSITION_FLUSH_DELAY: Duration = Duration::from_millis(500);
 const CLAUDE_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -118,6 +122,10 @@ fn default_toolbar_display() -> ToolbarDisplay {
     ToolbarDisplay::Bars
 }
 
+fn default_scale() -> f64 {
+    DEFAULT_SCALE
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct WindowPosition {
@@ -125,7 +133,7 @@ struct WindowPosition {
     y: i32,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct WidgetSettings {
     #[serde(default = "default_display_mode")]
@@ -136,6 +144,11 @@ struct WidgetSettings {
     keychain_access: KeychainAccess,
     #[serde(default = "default_toolbar_display")]
     toolbar_display: ToolbarDisplay,
+    // UI scale factor applied as native webview zoom plus a matching window
+    // resize, so fonts, meters, and charts grow together. Clamped on read and
+    // save to MIN_SCALE..=MAX_SCALE.
+    #[serde(default = "default_scale")]
+    scale: f64,
     #[serde(default)]
     window_position: Option<WindowPosition>,
 }
@@ -147,6 +160,7 @@ impl Default for WidgetSettings {
             background: WidgetBackground::Dark,
             keychain_access: KeychainAccess::Off,
             toolbar_display: ToolbarDisplay::Bars,
+            scale: DEFAULT_SCALE,
             window_position: None,
         }
     }
@@ -302,7 +316,10 @@ fn read_widget_settings() -> Result<WidgetSettings, String> {
         Err(error) => return Err(error.to_string()),
     };
 
-    serde_json::from_str::<WidgetSettings>(&contents).map_err(|error| error.to_string())
+    let mut settings =
+        serde_json::from_str::<WidgetSettings>(&contents).map_err(|error| error.to_string())?;
+    settings.scale = clamp_scale(settings.scale);
+    Ok(settings)
 }
 
 fn write_widget_settings(settings: &WidgetSettings) -> Result<(), String> {
@@ -392,17 +409,21 @@ fn save_widget_settings(
     app: AppHandle,
 ) -> Result<WidgetSettings, String> {
     let mut next = settings;
+    next.scale = clamp_scale(next.scale);
     flush_pending_window_position(app.state::<Arc<PendingWindowPosition>>().inner());
     let existing = read_widget_settings().unwrap_or_default();
     // The backend owns the window position: the UI's copy goes stale whenever
     // the user drags the widget, so positions echoed back here are ignored.
     next.window_position = existing.window_position;
-    let display_mode_changed = next.display_mode != existing.display_mode;
+    // Both a display-mode switch and a scale change resize the window, so the
+    // right edge is anchored to keep the widget from sliding off-screen.
+    let size_changed = next.display_mode != existing.display_mode
+        || (next.scale - existing.scale).abs() > f64::EPSILON;
 
     write_widget_settings(&next)?;
 
     if let Some(window) = app.get_webview_window("main") {
-        if let Some(position) = apply_window_settings(&window, &next, display_mode_changed) {
+        if let Some(position) = apply_window_settings(&window, &next, size_changed) {
             let adjusted_position = WindowPosition {
                 x: position.x,
                 y: position.y,
@@ -470,11 +491,52 @@ fn flush_pending_window_position(pending: &PendingWindowPosition) {
     }
 }
 
-fn window_size(display_mode: DisplayMode) -> (f64, f64) {
+fn base_window_size(display_mode: DisplayMode) -> (f64, f64) {
     match display_mode {
         DisplayMode::Simple => (SIMPLE_WIDTH, SIMPLE_HEIGHT),
         DisplayMode::Full => (FULL_WIDTH, FULL_HEIGHT),
     }
+}
+
+// The largest fraction of the requested scale that still fits the current
+// monitor's work area. The window is undecorated and non-resizable, so an
+// oversized frame would push the bottom of the full view off-screen with no way
+// to scroll or drag it back into view. base_height / work_area drives the cap;
+// width never approaches the screen, but it is checked for completeness.
+fn fit_scale_to_work_area<R: Runtime>(
+    window: &WebviewWindow<R>,
+    position: PhysicalPosition<i32>,
+    display_mode: DisplayMode,
+    scale: f64,
+) -> f64 {
+    let scale = clamp_scale(scale);
+    let (base_width, base_height) = base_window_size(display_mode);
+    let Some((left, top, right, bottom, scale_factor)) = work_area_for_position(window, position)
+    else {
+        return scale;
+    };
+    if scale_factor <= 0.0 {
+        return scale;
+    }
+
+    // work_area_for_position reports physical pixels; convert to the logical
+    // units set_size uses.
+    let area_width = ((right - left) as f64) / scale_factor;
+    let area_height = ((bottom - top) as f64) / scale_factor;
+    let max_scale_w = if base_width > 0.0 {
+        area_width / base_width
+    } else {
+        scale
+    };
+    let max_scale_h = if base_height > 0.0 {
+        area_height / base_height
+    } else {
+        scale
+    };
+
+    // Shrink to fit when the requested scale is too tall/wide, but never below a
+    // small floor so a misreported work area can't collapse the window.
+    scale.min(max_scale_w).min(max_scale_h).max(0.5)
 }
 
 fn apply_window_settings<R: Runtime>(
@@ -482,7 +544,7 @@ fn apply_window_settings<R: Runtime>(
     settings: &WidgetSettings,
     preserve_right_edge: bool,
 ) -> Option<PhysicalPosition<i32>> {
-    let (width, height) = window_size(settings.display_mode);
+    let (base_width, base_height) = base_window_size(settings.display_mode);
     let current_position = window.outer_position().ok();
     let current_size = window.outer_size().ok();
 
@@ -494,6 +556,15 @@ fn apply_window_settings<R: Runtime>(
     } else {
         stored_position.or(current_position)
     }?;
+
+    // Cap the requested scale to what this monitor can show so the window never
+    // overflows the work area. The same effective scale drives both the resize
+    // and the zoom so the content always fills the frame exactly.
+    let effective_scale =
+        fit_scale_to_work_area(window, position, settings.display_mode, settings.scale);
+    let width = base_width * effective_scale;
+    let height = base_height * effective_scale;
+
     let position = clamp_window_position(
         window,
         position,
@@ -504,6 +575,12 @@ fn apply_window_settings<R: Runtime>(
     );
 
     let _ = window.set_size(Size::Logical(LogicalSize::new(width, height)));
+
+    // Zoom the webview to match the grown window so the fixed-pixel layout
+    // (fonts, meters, charts) scales up to fill it instead of leaving the
+    // content tiny in a larger frame. set_zoom is supported on Linux and
+    // macOS 11+; a no-op fallback simply leaves the design at native size.
+    let _ = window.set_zoom(effective_scale);
 
     // Tauri reports physical coordinates. They can be negative on macOS or
     // Linux multi-monitor layouts, so store and replay the raw values.
@@ -754,6 +831,19 @@ fn clamp_percent(value: f64) -> f64 {
         return 0.0;
     }
     value.clamp(0.0, 100.0)
+}
+
+fn clamp_scale(value: f64) -> f64 {
+    if !value.is_finite() {
+        return DEFAULT_SCALE;
+    }
+    // Snap to the same 0.1 steps the settings UI emits and clamp to range, so a
+    // hand-edited or legacy settings.json can never make the rendered zoom
+    // disagree with the percentage shown in the stepper. The extra rounding
+    // strips binary-float dust like 1.2000000000000002.
+    let snapped = (value / SCALE_STEP).round() * SCALE_STEP;
+    let snapped = (snapped * 100.0).round() / 100.0;
+    snapped.clamp(MIN_SCALE, MAX_SCALE)
 }
 
 fn optional_f64_from_json<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
@@ -3176,6 +3266,25 @@ fn hide_widget_window(app: AppHandle) {
     hide_main_window(&app);
 }
 
+// Re-assert the webview zoom once the frontend has loaded. The zoom is first
+// applied from .setup(), which can run before the main webview finishes its
+// initial navigation; some WebKitGTK builds drop a zoom set that early. The
+// window is already sized by then, so this only re-applies the matching zoom
+// (using the same work-area-capped scale) and never resizes or moves it.
+#[tauri::command]
+fn reapply_widget_scale(app: AppHandle) {
+    let settings = read_widget_settings().unwrap_or_default();
+    if let Some(window) = app.get_webview_window("main") {
+        let effective_scale = match window.outer_position().ok() {
+            Some(position) => {
+                fit_scale_to_work_area(&window, position, settings.display_mode, settings.scale)
+            }
+            None => clamp_scale(settings.scale),
+        };
+        let _ = window.set_zoom(effective_scale);
+    }
+}
+
 fn sync_tray_title_from_response(app: &AppHandle, response: &UsageSnapshotResponse) {
     let settings = read_widget_settings().unwrap_or_default();
     if response.status == "ready" {
@@ -3512,7 +3621,8 @@ fn main() {
             get_widget_settings,
             save_widget_settings,
             show_settings_window,
-            hide_widget_window
+            hide_widget_window,
+            reapply_widget_scale
         ])
         .run(tauri::generate_context!())
         .expect("failed to run lilimit");
@@ -3757,5 +3867,66 @@ mod tests {
 
         assert_eq!(expanded, PhysicalPosition::new(520, 30));
         assert_eq!(collapsed, PhysicalPosition::new(600, 30));
+    }
+
+    #[test]
+    fn clamp_scale_constrains_and_sanitizes_values() {
+        assert_eq!(clamp_scale(1.5), 1.5);
+        assert_eq!(clamp_scale(0.1), MIN_SCALE);
+        assert_eq!(clamp_scale(9.0), MAX_SCALE);
+        // Non-finite inputs fall back to the default rather than a bound.
+        assert_eq!(clamp_scale(f64::NAN), DEFAULT_SCALE);
+        assert_eq!(clamp_scale(f64::INFINITY), DEFAULT_SCALE);
+        assert_eq!(clamp_scale(f64::NEG_INFINITY), DEFAULT_SCALE);
+    }
+
+    #[test]
+    fn clamp_scale_snaps_to_steps_matching_the_ui() {
+        // Out-of-step values snap to the nearest 0.1, mirroring the TS stepper
+        // so the rendered zoom always matches the percentage shown.
+        assert_eq!(clamp_scale(1.23), 1.2);
+        assert_eq!(clamp_scale(0.85), 0.9);
+        assert_eq!(clamp_scale(1.94), 1.9);
+        // Snapping does not introduce binary-float dust.
+        assert_eq!(clamp_scale(1.2), 1.2);
+    }
+
+    #[test]
+    fn base_window_size_matches_display_mode() {
+        assert_eq!(
+            base_window_size(DisplayMode::Simple),
+            (SIMPLE_WIDTH, SIMPLE_HEIGHT)
+        );
+        assert_eq!(
+            base_window_size(DisplayMode::Full),
+            (FULL_WIDTH, FULL_HEIGHT)
+        );
+    }
+
+    #[test]
+    fn scaled_window_dimensions_track_the_clamped_scale() {
+        // The effective scale multiplies both base dimensions; out-of-range
+        // factors are clamped first. (apply_window_settings applies this same
+        // base * effective_scale product after the work-area fit cap.)
+        let (base_w, base_h) = base_window_size(DisplayMode::Full);
+        assert_eq!(
+            (base_w * clamp_scale(1.5), base_h * clamp_scale(1.5)),
+            (FULL_WIDTH * 1.5, FULL_HEIGHT * 1.5)
+        );
+        assert_eq!(
+            (base_w * clamp_scale(10.0), base_h * clamp_scale(10.0)),
+            (FULL_WIDTH * MAX_SCALE, FULL_HEIGHT * MAX_SCALE)
+        );
+    }
+
+    #[test]
+    fn widget_settings_default_scale_is_unity() {
+        assert_eq!(WidgetSettings::default().scale, DEFAULT_SCALE);
+    }
+
+    #[test]
+    fn widget_settings_deserialize_defaults_missing_scale() {
+        let settings: WidgetSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(settings.scale, DEFAULT_SCALE);
     }
 }

@@ -278,6 +278,48 @@ h2 {
   color: #ffffff;
 }
 
+.stepper {
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr) 32px;
+  align-items: center;
+  gap: 6px;
+}
+
+.stepper-button {
+  height: 24px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  cursor: default;
+  font-size: 15px;
+  font-weight: 800;
+  line-height: 1;
+  padding: 0;
+}
+
+.stepper-button:hover:not(:disabled) {
+  background: var(--button-hover);
+  color: var(--text);
+}
+
+.stepper-button:disabled {
+  opacity: 0.4;
+}
+
+.stepper-button:focus-visible {
+  outline: 2px solid #49a3b0;
+  outline-offset: 2px;
+}
+
+.stepper-value {
+  text-align: center;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+}
+
 .settings-action {
   height: 26px;
   border: 1px solid var(--line);

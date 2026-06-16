@@ -53,8 +53,11 @@ The in-widget settings button lets you choose:
 - Background: `Dark` or `Light`
 - Keychain: `Off` or `Allow`
 - Toolbar: `Bars` or `Text`
+- Scale: `80%` to `200%` in 10% steps
 
 `Simple` keeps the small 280x140 monitor view. `Full` expands the widget to show detailed lilimit provider data, including usage rows, reset text, token/cost totals, credits when present, and recent daily usage bars. The last reported window position is saved automatically and restored on the next launch.
+
+`Scale` grows or shrinks the whole widget — window, fonts, meters, and charts together — which is handy when the default size is too small on high-resolution Ubuntu displays. It resizes the window and applies a matching webview zoom, so the layout stays sharp. The effective scale is capped to the monitor work area so the widget never grows past the visible screen, and the settings window itself stays at native size. Webview zoom needs macOS 11+ (Linux is fine); on older macOS the window only resizes.
 
 Keychain access is off by default. On macOS, `Allow` lets lilimit try a short, explicit read of Claude Code's `Claude Code-credentials` Keychain item if `~/.claude/.credentials.json` is missing. This is not Chrome cookie access. Ubuntu builds ignore macOS Keychain reads.
 
