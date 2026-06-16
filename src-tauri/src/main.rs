@@ -42,7 +42,6 @@ const FULL_WIDTH: f64 = 360.0;
 const FULL_HEIGHT: f64 = 560.0;
 const MIN_SCALE: f64 = 0.8;
 const MAX_SCALE: f64 = 2.0;
-const SCALE_STEP: f64 = 0.1;
 const DEFAULT_SCALE: f64 = 1.0;
 const COLLECTION_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const WINDOW_POSITION_FLUSH_DELAY: Duration = Duration::from_millis(500);
@@ -415,15 +414,16 @@ fn save_widget_settings(
     // The backend owns the window position: the UI's copy goes stale whenever
     // the user drags the widget, so positions echoed back here are ignored.
     next.window_position = existing.window_position;
-    // Both a display-mode switch and a scale change resize the window, so the
-    // right edge is anchored to keep the widget from sliding off-screen.
-    let size_changed = next.display_mode != existing.display_mode
-        || (next.scale - existing.scale).abs() > f64::EPSILON;
+    // Anchor the right edge only when switching display modes (so an expanding
+    // widget near the screen edge stays visible). Scale changes — whether from
+    // the stepper here or the resize grip — grow from the top-left, so both
+    // scale controls move the window the same way.
+    let display_mode_changed = next.display_mode != existing.display_mode;
 
     write_widget_settings(&next)?;
 
     if let Some(window) = app.get_webview_window("main") {
-        if let Some(position) = apply_window_settings(&window, &next, size_changed) {
+        if let Some(position) = apply_window_settings(&window, &next, display_mode_changed) {
             let adjusted_position = WindowPosition {
                 x: position.x,
                 y: position.y,
@@ -837,12 +837,11 @@ fn clamp_scale(value: f64) -> f64 {
     if !value.is_finite() {
         return DEFAULT_SCALE;
     }
-    // Snap to the same 0.1 steps the settings UI emits and clamp to range, so a
-    // hand-edited or legacy settings.json can never make the rendered zoom
-    // disagree with the percentage shown in the stepper. The extra rounding
-    // strips binary-float dust like 1.2000000000000002.
-    let snapped = (value / SCALE_STEP).round() * SCALE_STEP;
-    let snapped = (snapped * 100.0).round() / 100.0;
+    // Snap to whole-percent (0.01) steps and clamp to range. Whole percents keep
+    // the rendered zoom in agreement with the percentage the UI shows and strip
+    // binary-float dust like 1.2000000000000002, while still allowing the smooth
+    // values the resize grip produces (the stepper buttons move in 0.1 jumps).
+    let snapped = (value * 100.0).round() / 100.0;
     snapped.clamp(MIN_SCALE, MAX_SCALE)
 }
 
@@ -3285,6 +3284,43 @@ fn reapply_widget_scale(app: AppHandle) {
     }
 }
 
+// Live feedback while the user drags the resize grip: resize and zoom the main
+// window to the given scale without persisting or emitting. Persisting on every
+// pointer move would hammer the disk, and emitting settings-changed mid-drag
+// would re-render the widget and tear out the grip the pointer is captured on.
+// The window is anchored top-left (preserve_right_edge = false) so it grows
+// toward the bottom-right grip the pointer is dragging.
+#[tauri::command]
+fn preview_widget_scale(app: AppHandle, scale: f64) {
+    let mut settings = read_widget_settings().unwrap_or_default();
+    settings.scale = clamp_scale(scale);
+    if let Some(window) = app.get_webview_window("main") {
+        apply_window_settings(&window, &settings, false);
+    }
+}
+
+// Finalize a resize-grip drag: apply the scale, persist it together with the
+// resulting (clamped) position, and emit settings-changed so the settings
+// window's stepper readout and the tray catch up. Runs once on pointer-up.
+#[tauri::command]
+fn commit_widget_scale(app: AppHandle, scale: f64) -> Result<(), String> {
+    let mut settings = read_widget_settings().unwrap_or_default();
+    settings.scale = clamp_scale(scale);
+    if let Some(window) = app.get_webview_window("main") {
+        if let Some(position) = apply_window_settings(&window, &settings, false) {
+            settings.window_position = Some(WindowPosition {
+                x: position.x,
+                y: position.y,
+            });
+        }
+    }
+    write_widget_settings(&settings)?;
+    let _ = app.emit_to("main", "settings-changed", &settings);
+    let _ = app.emit_to("settings", "settings-changed", &settings);
+    sync_tray_title_from_current_snapshot(&app);
+    Ok(())
+}
+
 fn sync_tray_title_from_response(app: &AppHandle, response: &UsageSnapshotResponse) {
     let settings = read_widget_settings().unwrap_or_default();
     if response.status == "ready" {
@@ -3622,7 +3658,9 @@ fn main() {
             save_widget_settings,
             show_settings_window,
             hide_widget_window,
-            reapply_widget_scale
+            reapply_widget_scale,
+            preview_widget_scale,
+            commit_widget_scale
         ])
         .run(tauri::generate_context!())
         .expect("failed to run lilimit");
@@ -3881,12 +3919,12 @@ mod tests {
     }
 
     #[test]
-    fn clamp_scale_snaps_to_steps_matching_the_ui() {
-        // Out-of-step values snap to the nearest 0.1, mirroring the TS stepper
-        // so the rendered zoom always matches the percentage shown.
-        assert_eq!(clamp_scale(1.23), 1.2);
-        assert_eq!(clamp_scale(0.85), 0.9);
-        assert_eq!(clamp_scale(1.94), 1.9);
+    fn clamp_scale_snaps_to_whole_percent_steps() {
+        // Values snap to the nearest whole percent (0.01), matching the integer
+        // percentage the UI shows while still allowing smooth resize-grip drags.
+        assert_eq!(clamp_scale(1.234), 1.23);
+        assert_eq!(clamp_scale(1.236), 1.24);
+        assert_eq!(clamp_scale(0.85), 0.85);
         // Snapping does not introduce binary-float dust.
         assert_eq!(clamp_scale(1.2), 1.2);
     }

@@ -85,12 +85,20 @@ type UsageSnapshot = {
 
 const REFRESH_MS = 5 * 60 * 1000;
 const STALE_MS = 15 * 60 * 1000;
-// Mirrors the MIN_SCALE/MAX_SCALE/step the Rust backend clamps to; the actual
+// Mirrors the MIN_SCALE/MAX_SCALE the Rust backend clamps to; the actual
 // scaling is applied natively (window resize + webview zoom) by the backend.
+// SCALE_STEP is the stepper-button increment; the resize grip varies the scale
+// continuously between whole-percent values.
 const MIN_SCALE = 0.8;
 const MAX_SCALE = 2;
 const SCALE_STEP = 0.1;
 const DEFAULT_SCALE = 1;
+// Base (100%) window size per display mode, mirroring the Rust backend. Used to
+// translate resize-grip drag distance into a scale delta that feels 1:1.
+const BASE_WINDOW_SIZE: Record<DisplayMode, { width: number; height: number }> = {
+  simple: { width: 280, height: 140 },
+  full: { width: 360, height: 560 },
+};
 const DEFAULT_SETTINGS: WidgetSettings = {
   displayMode: "simple",
   background: "dark",
@@ -115,16 +123,24 @@ let settingsError: string | null = null;
 let collectionError: string | null = null;
 let refreshInProgress = false;
 let currentFullTab: FullTab = "overview";
+// Resize-grip drag state (see bindResizeGrip). resizeStart is non-null only
+// while a grip drag is in progress; renderCurrent() defers full re-renders for
+// that span so the pointer-captured grip element is not torn out of the DOM.
+let resizeStart: { x: number; y: number; scale: number } | null = null;
+let resizePending: number | null = null;
+let resizeRaf: number | null = null;
+let renderDeferred = false;
 
-// Snap to one-decimal steps and clamp; keeps stored values aligned with the
-// stepper so the readout always shows clean percentages.
+// Snap to whole-percent steps and clamp. Whole percents keep the readout exact
+// and match the Rust backend, while still allowing the smooth values the resize
+// grip produces (the stepper buttons jump by SCALE_STEP).
 function clampScale(value: number | null | undefined): number {
   if (typeof value !== "number" || !Number.isFinite(value)) {
     return DEFAULT_SCALE;
   }
 
-  const snapped = Math.round(value / SCALE_STEP) * SCALE_STEP;
-  return Math.min(MAX_SCALE, Math.max(MIN_SCALE, Math.round(snapped * 100) / 100));
+  const snapped = Math.round(value * 100) / 100;
+  return Math.min(MAX_SCALE, Math.max(MIN_SCALE, snapped));
 }
 
 function clampPercent(value: number | null): number | null {
@@ -1063,6 +1079,13 @@ function renderApp(snapshot: UsageSnapshot): void {
 }
 
 function renderCurrent(): void {
+  // A grip drag holds pointer capture on the live DOM. Rebuilding innerHTML
+  // (e.g. from the periodic refresh) would detach the captured grip and
+  // silently abort the gesture, so defer the render until the drag finishes.
+  if (resizeStart) {
+    renderDeferred = true;
+    return;
+  }
   if (latestSnapshot) {
     renderApp(latestSnapshot);
   } else {
@@ -1100,6 +1123,113 @@ async function saveSettings(patch: Partial<WidgetSettings>): Promise<void> {
   }
 
   renderAfterSettingsChange();
+}
+
+function flushResizePreview(): void {
+  resizeRaf = null;
+  if (resizeStart && resizePending !== null) {
+    void invoke("preview_widget_scale", { scale: resizePending }).catch(() => {
+      // Live preview is best-effort; the commit on release is the source of truth.
+    });
+  }
+}
+
+// Largest scale that still fits the current monitor for the given mode. Clamps
+// the grip drag so it can't request more than the window can actually show —
+// without it the cursor would detach from a window pinned at the work-area cap
+// and the return drag would have dead travel. The backend caps too; this just
+// keeps the pointer and the window edge in agreement. The grip drives the
+// widget scale: dragging it grows the window and zooms the content together,
+// reusing the same scale pipeline as the stepper. During the drag we only call
+// preview_widget_scale (live resize, no persist/re-render) so the captured grip
+// survives; commit_widget_scale runs once on release.
+function fitScaleCeiling(mode: DisplayMode): number {
+  const base = BASE_WINDOW_SIZE[mode];
+  // screen.avail* is in CSS px (the monitor work area), matching the logical
+  // units the backend sizes the window in. Fall back to MAX_SCALE if unknown.
+  const availWidth = window.screen?.availWidth || base.width * MAX_SCALE;
+  const availHeight = window.screen?.availHeight || base.height * MAX_SCALE;
+  return Math.min(MAX_SCALE, availWidth / base.width, availHeight / base.height);
+}
+
+function bindResizeGrip(surface: HTMLElement): void {
+  const grip = document.createElement("div");
+  grip.className = "resize-grip";
+  grip.setAttribute("aria-hidden", "true");
+  grip.title = "Drag to resize";
+  grip.innerHTML = `
+    <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+      <path d="M15 6 6 15 M15 10 10 15 M15 14 14 15"></path>
+    </svg>
+  `;
+
+  grip.addEventListener("pointerdown", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    try {
+      grip.setPointerCapture(event.pointerId);
+    } catch {
+      // Pointer may already be released; the drag simply won't track.
+    }
+    // screen coordinates stay stable while the window itself resizes mid-drag.
+    resizeStart = { x: event.screenX, y: event.screenY, scale: clampScale(currentSettings.scale) };
+    resizePending = null;
+  });
+
+  grip.addEventListener("pointermove", (event) => {
+    if (!resizeStart) {
+      return;
+    }
+    const base = BASE_WINDOW_SIZE[currentSettings.displayMode];
+    const dx = event.screenX - resizeStart.x;
+    const dy = event.screenY - resizeStart.y;
+    // Average the horizontal and vertical pull so dragging the corner out by
+    // roughly the widget's own size changes the scale by ~100%, then cap to what
+    // fits the screen so the window edge stays under the cursor.
+    const delta = 0.5 * (dx / base.width + dy / base.height);
+    const requested = Math.min(resizeStart.scale + delta, fitScaleCeiling(currentSettings.displayMode));
+    resizePending = clampScale(requested);
+    if (resizeRaf === null) {
+      resizeRaf = window.requestAnimationFrame(flushResizePreview);
+    }
+  });
+
+  const finish = (event: PointerEvent): void => {
+    if (!resizeStart) {
+      return;
+    }
+    if (resizeRaf !== null) {
+      window.cancelAnimationFrame(resizeRaf);
+      resizeRaf = null;
+    }
+    try {
+      grip.releasePointerCapture(event.pointerId);
+    } catch {
+      // Already released.
+    }
+    const dragged = resizePending !== null;
+    const finalScale = resizePending ?? resizeStart.scale;
+    resizeStart = null;
+    resizePending = null;
+    if (dragged) {
+      // Reflect locally so a later stepper step builds on the dragged value,
+      // then persist once. The commit emits settings-changed, re-rendering here.
+      currentSettings = normalizeSettings({ ...currentSettings, scale: finalScale });
+      void invoke("commit_widget_scale", { scale: finalScale }).catch(() => {
+        // Non-fatal: the live preview already left the window at this size.
+      });
+    }
+    // Apply any refresh that arrived (and was deferred) during the drag.
+    if (renderDeferred) {
+      renderDeferred = false;
+      renderCurrent();
+    }
+  };
+
+  grip.addEventListener("pointerup", finish);
+  grip.addEventListener("pointercancel", finish);
+
+  surface.appendChild(grip);
 }
 
 function bindInteractions(): void {
@@ -1181,6 +1311,13 @@ function bindInteractions(): void {
   appRoot.querySelector(".close-settings-button")?.addEventListener("click", () => {
     hideSettingsWindow();
   });
+
+  if (!isSettingsWindow) {
+    const surface = appRoot.querySelector<HTMLElement>(".surface");
+    if (surface) {
+      bindResizeGrip(surface);
+    }
+  }
 }
 
 function hideSettingsWindow(): void {

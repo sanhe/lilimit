@@ -320,6 +320,39 @@ h2 {
   font-variant-numeric: tabular-nums;
 }
 
+/* Bottom-right corner grip: drag to resize the widget and zoom its content
+   together. Sits above the content and outside the drag-to-move regions so a
+   press starts a resize, not a window move. */
+.resize-grip {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  z-index: 6;
+  display: grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  color: var(--subtle);
+  cursor: nwse-resize;
+  opacity: 0.55;
+  touch-action: none;
+}
+
+.resize-grip:hover {
+  color: var(--text);
+  opacity: 0.95;
+}
+
+.resize-grip svg {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  pointer-events: none;
+}
+
 .settings-action {
   height: 26px;
   border: 1px solid var(--line);
