@@ -120,6 +120,13 @@ chmod +x lilimit_*.AppImage
 ./lilimit_*.AppImage
 ```
 
+The application icon (in the GNOME dash, app grid, and dock) comes from the installed `.deb`, which registers `lilimit.desktop` and the hicolor icon set. It does not appear when running `pnpm tauri:dev` or a bare AppImage in place, since those do not install a desktop entry. If the icon is missing or stale right after installing the `.deb`, refresh the caches and re-login (or restart GNOME Shell):
+
+```sh
+sudo gtk-update-icon-cache -f /usr/share/icons/hicolor
+sudo update-desktop-database
+```
+
 Before launching lilimit, sign in with the CLIs you want it to read:
 
 ```sh
