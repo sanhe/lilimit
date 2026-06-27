@@ -1851,20 +1851,28 @@ fn load_codex_local_token_usage() -> Option<(Option<TokenUsageSummary>, Vec<Dail
 }
 
 fn load_claude_local_token_usage() -> Option<(Option<TokenUsageSummary>, Vec<DailyUsagePoint>)> {
-    let cache_dir = codexbar_cost_cache_dir()?;
     let today = Local::now().date_naive();
     let since = today.checked_sub_days(Days::new(29)).unwrap_or(today);
     let mut days: BTreeMap<String, LocalDayUsage> = BTreeMap::new();
     let mut models: HashMap<String, LocalModelUsage> = HashMap::new();
 
-    if let Some(cache) = read_json_file::<CodexBarCostCache>(&cache_dir.join("claude-v2.json")) {
-        merge_claude_cost_cache(cache, since, today, &mut days, &mut models);
+    // CodexBar's cost caches only exist on macOS. Everywhere else (and on macOS
+    // when CodexBar isn't installed) fall back to Claude Code's own session logs.
+    if let Some(cache_dir) = codexbar_cost_cache_dir() {
+        if let Some(cache) = read_json_file::<CodexBarCostCache>(&cache_dir.join("claude-v2.json"))
+        {
+            merge_claude_cost_cache(cache, since, today, &mut days, &mut models);
+        }
+
+        if let Some(cache) =
+            read_json_file::<PiSessionCostCache>(&cache_dir.join("pi-sessions-v2.json"))
+        {
+            merge_pi_claude_cost_cache(cache, since, today, &mut days, &mut models);
+        }
     }
 
-    if let Some(cache) =
-        read_json_file::<PiSessionCostCache>(&cache_dir.join("pi-sessions-v2.json"))
-    {
-        merge_pi_claude_cost_cache(cache, since, today, &mut days, &mut models);
+    if days.is_empty() {
+        scan_claude_session_logs(since, today, &mut days, &mut models);
     }
 
     summarize_local_token_usage(&days, &models)
@@ -2039,6 +2047,199 @@ fn codex_session_file_date(path: &Path) -> Option<NaiveDate> {
     let filename = path.file_name()?.to_str()?;
     let date = filename.strip_prefix("rollout-")?.get(..10)?;
     NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()
+}
+
+// Claude Code writes session transcripts as JSONL under
+// ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl. Each assistant line
+// carries `message.usage` token counts and `message.model`, so we can estimate
+// Claude cost at API rates the same way CodexBar does for its cached snapshot.
+fn claude_projects_dir() -> Option<PathBuf> {
+    Some(home_dir().ok()?.join(".claude").join("projects"))
+}
+
+fn scan_claude_session_logs(
+    since: NaiveDate,
+    until: NaiveDate,
+    days: &mut BTreeMap<String, LocalDayUsage>,
+    models: &mut HashMap<String, LocalModelUsage>,
+) {
+    let Some(root) = claude_projects_dir() else {
+        return;
+    };
+    let mut files = Vec::new();
+    collect_claude_session_files(&root, since, &mut files, 8);
+    files.sort();
+    // Claude Code logs each assistant turn several times while it streams: the
+    // early lines carry placeholder usage (a tiny output_tokens count) and a
+    // later line carries the final totals, all under the same (message.id,
+    // requestId). Resumed and forked sessions can also repeat a turn across
+    // files. Keep one entry per id — the one with the largest total, i.e. the
+    // final line — so we neither double count nor keep a partial placeholder.
+    let mut best: HashMap<String, ClaudeUsageEntry> = HashMap::new();
+    for path in files {
+        scan_claude_session_file(&path, since, until, days, models, &mut best);
+    }
+    for entry in best.into_values() {
+        record_daily_usage(
+            days,
+            models,
+            &entry.day_key,
+            &entry.model,
+            entry.tokens,
+            entry.cost,
+        );
+    }
+}
+
+fn collect_claude_session_files(
+    root: &Path,
+    since: NaiveDate,
+    files: &mut Vec<PathBuf>,
+    max_depth: usize,
+) {
+    let Some(remaining_depth) = max_depth.checked_sub(1) else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_claude_session_files(&path, since, files, remaining_depth);
+            continue;
+        }
+
+        if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+            continue;
+        }
+        // Filenames are session UUIDs, not dates, so bound the work by the file's
+        // last-modified time: a file untouched since before the window can't hold
+        // any in-range lines. Per-line timestamps still gate what we count.
+        if claude_session_file_in_range(&path, since) {
+            files.push(path);
+        }
+    }
+}
+
+fn claude_session_file_in_range(path: &Path, since: NaiveDate) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return true;
+    };
+    let Ok(modified) = metadata.modified() else {
+        return true;
+    };
+    let modified: DateTime<Utc> = modified.into();
+    modified.with_timezone(&Local).date_naive() >= since
+}
+
+fn scan_claude_session_file(
+    path: &Path,
+    since: NaiveDate,
+    until: NaiveDate,
+    days: &mut BTreeMap<String, LocalDayUsage>,
+    models: &mut HashMap<String, LocalModelUsage>,
+    best: &mut HashMap<String, ClaudeUsageEntry>,
+) {
+    let Ok(file) = fs::File::open(path) else {
+        return;
+    };
+    let reader = BufReader::new(file);
+    for line in reader.lines().map_while(Result::ok) {
+        let Some(entry) = parse_claude_usage_line(&line, since, until) else {
+            continue;
+        };
+        match entry.dedup_key.clone() {
+            // Keyed lines are deduped globally; keep the largest (final) total.
+            Some(key) => {
+                let replace = match best.get(&key) {
+                    Some(existing) => entry.tokens > existing.tokens,
+                    None => true,
+                };
+                if replace {
+                    best.insert(key, entry);
+                }
+            }
+            // Without ids we can't dedupe, so count each line as it arrives.
+            None => record_daily_usage(
+                days,
+                models,
+                &entry.day_key,
+                &entry.model,
+                entry.tokens,
+                entry.cost,
+            ),
+        }
+    }
+}
+
+struct ClaudeUsageEntry {
+    day_key: String,
+    model: String,
+    tokens: i64,
+    cost: Option<f64>,
+    dedup_key: Option<String>,
+}
+
+fn parse_claude_usage_line(
+    line: &str,
+    since: NaiveDate,
+    until: NaiveDate,
+) -> Option<ClaudeUsageEntry> {
+    if !line.contains("\"usage\"") {
+        return None;
+    }
+    let value = serde_json::from_str::<Value>(line).ok()?;
+    if value.get("type").and_then(Value::as_str) != Some("assistant") {
+        return None;
+    }
+    let message = value.get("message")?;
+    let usage = message.get("usage").filter(|value| !value.is_null())?;
+
+    let timestamp = value.get("timestamp").and_then(Value::as_str)?;
+    let day_key = local_day_key_from_timestamp(timestamp)?;
+    if !day_key_in_range(&day_key, since, until) {
+        return None;
+    }
+
+    let model = normalize_claude_model(&string_at(message, &["model"]).unwrap_or_default());
+    if model.is_empty() {
+        return None;
+    }
+
+    let input = i64_at(usage, &["input_tokens"]).unwrap_or_default().max(0);
+    let cache_read = i64_at(usage, &["cache_read_input_tokens"])
+        .unwrap_or_default()
+        .max(0);
+    let cache_creation = i64_at(usage, &["cache_creation_input_tokens"])
+        .unwrap_or_default()
+        .max(0);
+    let output = i64_at(usage, &["output_tokens"]).unwrap_or_default().max(0);
+    let tokens = input
+        .saturating_add(cache_read)
+        .saturating_add(cache_creation)
+        .saturating_add(output);
+    if tokens <= 0 {
+        return None;
+    }
+
+    let cost = claude_cost_usd(&model, input, cache_read, cache_creation, output);
+    let dedup_key = match (
+        string_at(message, &["id"]),
+        string_at(&value, &["requestId"]),
+    ) {
+        (Some(message_id), Some(request_id)) => Some(format!("{message_id}:{request_id}")),
+        _ => None,
+    };
+
+    Some(ClaudeUsageEntry {
+        day_key,
+        model,
+        tokens,
+        cost,
+        dedup_key,
+    })
 }
 
 fn local_day_key_from_timestamp(timestamp: &str) -> Option<String> {
@@ -2628,11 +2829,23 @@ fn claude_model_pricing_exact(model: &str) -> Option<ClaudeModelPricing> {
         | "claude-opus-4-5"
         | "claude-opus-4-6-20260205"
         | "claude-opus-4-6"
-        | "claude-opus-4-7" => ClaudeModelPricing {
+        | "claude-opus-4-7"
+        | "claude-opus-4-8" => ClaudeModelPricing {
             input_rate: 5e-6,
             output_rate: 2.5e-5,
             cache_creation_rate: 6.25e-6,
             cache_read_rate: 5e-7,
+            threshold_tokens: None,
+            input_rate_above_threshold: None,
+            output_rate_above_threshold: None,
+            cache_creation_rate_above_threshold: None,
+            cache_read_rate_above_threshold: None,
+        },
+        "claude-fable-5" | "claude-mythos-5" => ClaudeModelPricing {
+            input_rate: 1e-5,
+            output_rate: 5e-5,
+            cache_creation_rate: 1.25e-5,
+            cache_read_rate: 1e-6,
             threshold_tokens: None,
             input_rate_above_threshold: None,
             output_rate_above_threshold: None,
@@ -2802,7 +3015,17 @@ async fn fetch_claude_provider(
         credentials.rate_limit_tier.as_deref(),
     )
     .or_else(|| Some("Pro".to_string()));
-    Ok(claude_provider_from_usage_with_plan(usage, plan_text))
+    // Reading Claude's local session logs walks the filesystem and parses JSONL;
+    // keep that off the async runtime's worker threads (like the Keychain read
+    // above). On Linux this fallback runs on every refresh.
+    let local_usage = tauri::async_runtime::spawn_blocking(load_claude_local_token_usage)
+        .await
+        .map_err(|error| UsageFetchError::Message(error.to_string()))?;
+    Ok(claude_provider_from_usage_with_local_usage(
+        usage,
+        plan_text,
+        local_usage,
+    ))
 }
 
 fn load_claude_credentials(keychain_access: KeychainAccess) -> Result<ClaudeCredentials, String> {
@@ -2910,14 +3133,6 @@ async fn fetch_claude_usage(
 #[cfg(test)]
 fn claude_provider_from_usage(response: ClaudeOAuthUsageResponse) -> ProviderUsage {
     claude_provider_from_usage_with_local_usage(response, Some("Pro".to_string()), None)
-}
-
-fn claude_provider_from_usage_with_plan(
-    response: ClaudeOAuthUsageResponse,
-    plan_text: Option<String>,
-) -> ProviderUsage {
-    let local_usage = load_claude_local_token_usage();
-    claude_provider_from_usage_with_local_usage(response, plan_text, local_usage)
 }
 
 fn claude_provider_from_usage_with_local_usage(
@@ -3966,5 +4181,265 @@ mod tests {
     fn widget_settings_deserialize_defaults_missing_scale() {
         let settings: WidgetSettings = serde_json::from_str("{}").unwrap();
         assert_eq!(settings.scale, DEFAULT_SCALE);
+    }
+
+    // tokens are [input, cache_read, cache_creation, output].
+    fn claude_assistant_line(
+        timestamp: &str,
+        model: &str,
+        ids: (&str, &str),
+        tokens: [i64; 4],
+    ) -> String {
+        let (message_id, request_id) = ids;
+        json!({
+            "type": "assistant",
+            "timestamp": timestamp,
+            "requestId": request_id,
+            "message": {
+                "id": message_id,
+                "model": model,
+                "role": "assistant",
+                "usage": {
+                    "input_tokens": tokens[0],
+                    "cache_read_input_tokens": tokens[1],
+                    "cache_creation_input_tokens": tokens[2],
+                    "output_tokens": tokens[3],
+                },
+            },
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn parses_claude_session_usage_line_with_cost_and_dedup_key() {
+        let since = NaiveDate::from_ymd_opt(2026, 6, 1).unwrap();
+        let until = NaiveDate::from_ymd_opt(2026, 6, 30).unwrap();
+        let line = claude_assistant_line(
+            "2026-06-16T10:28:10.882Z",
+            "claude-haiku-4-5",
+            ("msg_1", "req_1"),
+            [1_000_000, 2_000_000, 500_000, 10_000],
+        );
+
+        let entry = parse_claude_usage_line(&line, since, until).expect("entry");
+        assert_eq!(entry.model, "claude-haiku-4-5");
+        assert_eq!(entry.tokens, 3_510_000);
+        // input 1e-6 + cache_read 1e-7 + cache_creation 1.25e-6 + output 5e-6.
+        let cost = entry.cost.expect("priced");
+        let expected =
+            1_000_000.0 * 1e-6 + 2_000_000.0 * 1e-7 + 500_000.0 * 1.25e-6 + 10_000.0 * 5e-6;
+        assert!((cost - expected).abs() < 1e-9, "cost {cost} != {expected}");
+        assert_eq!(entry.dedup_key.as_deref(), Some("msg_1:req_1"));
+    }
+
+    #[test]
+    fn skips_claude_lines_outside_window_and_without_usage() {
+        let since = NaiveDate::from_ymd_opt(2026, 6, 1).unwrap();
+        let until = NaiveDate::from_ymd_opt(2026, 6, 30).unwrap();
+
+        let old = claude_assistant_line(
+            "2026-05-01T10:00:00.000Z",
+            "claude-haiku-4-5",
+            ("msg_old", "req_old"),
+            [10, 0, 0, 10],
+        );
+        assert!(parse_claude_usage_line(&old, since, until).is_none());
+
+        // User turns (no assistant usage) are ignored.
+        let user = json!({
+            "type": "user",
+            "timestamp": "2026-06-10T10:00:00.000Z",
+            "message": { "role": "user", "content": "hi" },
+        })
+        .to_string();
+        assert!(parse_claude_usage_line(&user, since, until).is_none());
+    }
+
+    #[test]
+    fn counts_unpriced_claude_model_tokens_without_cost() {
+        let since = NaiveDate::from_ymd_opt(2026, 6, 1).unwrap();
+        let until = NaiveDate::from_ymd_opt(2026, 6, 30).unwrap();
+        // A model with no pricing entry still contributes tokens, just no cost.
+        let line = claude_assistant_line(
+            "2026-06-16T10:00:00.000Z",
+            "claude-some-future-model",
+            ("msg_x", "req_x"),
+            [5, 0, 0, 5],
+        );
+        let entry = parse_claude_usage_line(&line, since, until).expect("entry");
+        assert_eq!(entry.tokens, 10);
+        assert!(entry.cost.is_none());
+    }
+
+    #[test]
+    fn opus_48_and_fable_5_are_priced() {
+        assert!(claude_model_pricing_exact("claude-opus-4-8").is_some());
+        let fable = claude_model_pricing_exact("claude-fable-5").expect("fable priced");
+        assert_eq!(fable.input_rate, 1e-5);
+        assert_eq!(fable.output_rate, 5e-5);
+    }
+
+    // Replicates the production accumulation: keyed lines keep the largest
+    // (final) total per id; keyless lines are counted as-is.
+    fn aggregate_claude_lines(lines: &[String], since: NaiveDate, until: NaiveDate) -> i64 {
+        let mut days: BTreeMap<String, LocalDayUsage> = BTreeMap::new();
+        let mut models: HashMap<String, LocalModelUsage> = HashMap::new();
+        let mut best: HashMap<String, ClaudeUsageEntry> = HashMap::new();
+        for line in lines {
+            let Some(entry) = parse_claude_usage_line(line, since, until) else {
+                continue;
+            };
+            match entry.dedup_key.clone() {
+                Some(key) => {
+                    let replace = match best.get(&key) {
+                        Some(existing) => entry.tokens > existing.tokens,
+                        None => true,
+                    };
+                    if replace {
+                        best.insert(key, entry);
+                    }
+                }
+                None => record_daily_usage(
+                    &mut days,
+                    &mut models,
+                    &entry.day_key,
+                    &entry.model,
+                    entry.tokens,
+                    entry.cost,
+                ),
+            }
+        }
+        for entry in best.into_values() {
+            record_daily_usage(
+                &mut days,
+                &mut models,
+                &entry.day_key,
+                &entry.model,
+                entry.tokens,
+                entry.cost,
+            );
+        }
+        days.values().map(|usage| usage.total_tokens).sum()
+    }
+
+    #[test]
+    fn keeps_final_usage_not_streaming_placeholder_per_claude_id() {
+        let since = NaiveDate::from_ymd_opt(2026, 6, 1).unwrap();
+        let until = NaiveDate::from_ymd_opt(2026, 6, 30).unwrap();
+
+        // Claude Code logs the same (message id, request id) several times while
+        // streaming: a placeholder line (output_tokens=5) then the final line
+        // (output_tokens=300). Only the final total should be kept — keeping the
+        // first-seen placeholder would undercount output (the priciest tokens).
+        let lines = [
+            claude_assistant_line(
+                "2026-06-16T10:00:00.000Z",
+                "claude-haiku-4-5",
+                ("msg_a", "req_a"),
+                [2000, 0, 0, 5],
+            ),
+            claude_assistant_line(
+                "2026-06-16T10:00:00.000Z",
+                "claude-haiku-4-5",
+                ("msg_a", "req_a"),
+                [2000, 0, 0, 300],
+            ),
+            claude_assistant_line(
+                "2026-06-16T11:00:00.000Z",
+                "claude-haiku-4-5",
+                ("msg_b", "req_b"),
+                [1000, 0, 0, 40],
+            ),
+        ];
+
+        // msg_a -> 2000 + 300 = 2300 (final), msg_b -> 1040.
+        assert_eq!(aggregate_claude_lines(&lines, since, until), 3340);
+    }
+
+    #[test]
+    fn scans_claude_session_files_and_dedupes_across_files() {
+        use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+        let since = NaiveDate::from_ymd_opt(2026, 6, 1).unwrap();
+        let until = NaiveDate::from_ymd_opt(2026, 6, 30).unwrap();
+        let dir = env::temp_dir().join(format!(
+            "lilimit-claude-scan-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, AtomicOrdering::Relaxed)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+
+        let file_a = dir.join("session-a.jsonl");
+        let file_b = dir.join("session-b.jsonl");
+        // file_a: msg_a streams as a placeholder (out=5) then a final line
+        // (out=160) within the same file, plus a distinct msg_b.
+        fs::write(
+            &file_a,
+            format!(
+                "{}\n{}\n{}\n",
+                claude_assistant_line(
+                    "2026-06-16T10:00:00.000Z",
+                    "claude-haiku-4-5",
+                    ("msg_a", "req_a"),
+                    [0, 0, 0, 5],
+                ),
+                claude_assistant_line(
+                    "2026-06-16T10:00:00.000Z",
+                    "claude-haiku-4-5",
+                    ("msg_a", "req_a"),
+                    [0, 0, 0, 160],
+                ),
+                claude_assistant_line(
+                    "2026-06-16T10:05:00.000Z",
+                    "claude-haiku-4-5",
+                    ("msg_b", "req_b"),
+                    [0, 0, 0, 50],
+                ),
+            ),
+        )
+        .unwrap();
+        // file_b: a forked session re-logs msg_a's final line plus a new msg_c.
+        fs::write(
+            &file_b,
+            format!(
+                "{}\n{}\n",
+                claude_assistant_line(
+                    "2026-06-16T10:00:00.000Z",
+                    "claude-haiku-4-5",
+                    ("msg_a", "req_a"),
+                    [0, 0, 0, 160],
+                ),
+                claude_assistant_line(
+                    "2026-06-16T11:00:00.000Z",
+                    "claude-haiku-4-5",
+                    ("msg_c", "req_c"),
+                    [0, 0, 0, 25],
+                ),
+            ),
+        )
+        .unwrap();
+
+        let mut days: BTreeMap<String, LocalDayUsage> = BTreeMap::new();
+        let mut models: HashMap<String, LocalModelUsage> = HashMap::new();
+        let mut best: HashMap<String, ClaudeUsageEntry> = HashMap::new();
+        scan_claude_session_file(&file_a, since, until, &mut days, &mut models, &mut best);
+        scan_claude_session_file(&file_b, since, until, &mut days, &mut models, &mut best);
+        for entry in best.into_values() {
+            record_daily_usage(
+                &mut days,
+                &mut models,
+                &entry.day_key,
+                &entry.model,
+                entry.tokens,
+                entry.cost,
+            );
+        }
+
+        let total: i64 = days.values().map(|usage| usage.total_tokens).sum();
+        // msg_a final 160 (placeholder 5 dropped, cross-file dup ignored) + 50 + 25.
+        assert_eq!(total, 235);
+
+        fs::remove_dir_all(&dir).ok();
     }
 }
