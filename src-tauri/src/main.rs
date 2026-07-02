@@ -5,10 +5,10 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
     },
     thread,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 #[cfg(target_os = "macos")]
 use std::{
@@ -44,6 +44,12 @@ const MIN_SCALE: f64 = 0.8;
 const MAX_SCALE: f64 = 2.0;
 const DEFAULT_SCALE: f64 = 1.0;
 const COLLECTION_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
+// The widget polls at the same 5-minute period, but updatedAt is stamped when
+// a collection *finishes*, so each tick would find a snapshot a few seconds
+// younger than the full window and skip every other collection (an effective
+// 10-minute cadence). Treat a snapshot within this tolerance of expiring as
+// stale so one poll tick can't slide past the cache window.
+const COLLECTION_FRESHNESS_TOLERANCE: Duration = Duration::from_secs(45);
 const WINDOW_POSITION_FLUSH_DELAY: Duration = Duration::from_millis(500);
 const CLAUDE_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const CLAUDE_RATE_LIMIT_BASE_BACKOFF: Duration = Duration::from_secs(5 * 60);
@@ -341,22 +347,40 @@ fn write_atomic(path: &Path, contents: &str, default_mode: u32) -> Result<(), St
         .and_then(|name| name.to_str())
         .unwrap_or("file");
     let temp_path = parent.join(format!(".{file_name}.{}.tmp", std::process::id()));
-    fs::write(&temp_path, contents).map_err(|error| error.to_string())?;
 
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        // Contents can hold OAuth tokens, so the temp file must never be
+        // readable by other users: create it 0o600 before writing any bytes,
+        // and only then widen to the target mode. A leftover temp file from a
+        // crashed run is removed first so the restrictive create mode applies.
+        let _ = fs::remove_file(&temp_path);
+        let write_result = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temp_path)
+            .and_then(|mut file| file.write_all(contents.as_bytes()));
+        if let Err(error) = write_result {
+            let _ = fs::remove_file(&temp_path);
+            return Err(error.to_string());
+        }
         let mode = fs::metadata(path)
             .map(|metadata| metadata.permissions().mode() & 0o777)
             .unwrap_or(default_mode);
-        if let Err(error) = fs::set_permissions(&temp_path, fs::Permissions::from_mode(mode)) {
-            let _ = fs::remove_file(&temp_path);
-            return Err(error.to_string());
+        if mode != 0o600 {
+            if let Err(error) = fs::set_permissions(&temp_path, fs::Permissions::from_mode(mode)) {
+                let _ = fs::remove_file(&temp_path);
+                return Err(error.to_string());
+            }
         }
     }
     #[cfg(not(unix))]
     {
         let _ = default_mode;
+        fs::write(&temp_path, contents).map_err(|error| error.to_string())?;
     }
 
     fs::rename(&temp_path, path).map_err(|error| {
@@ -1087,7 +1111,10 @@ async fn refresh_collected_usage_snapshot(
     let previous_snapshot = read_collected_usage_snapshot_file().unwrap_or(None);
     if !force {
         if let Some(snapshot) = previous_snapshot.as_ref() {
-            if snapshot_is_fresh(snapshot, COLLECTION_REFRESH_INTERVAL) {
+            if snapshot_is_fresh(
+                snapshot,
+                COLLECTION_REFRESH_INTERVAL.saturating_sub(COLLECTION_FRESHNESS_TOLERANCE),
+            ) {
                 let response = response_from_snapshot_file(snapshot)?;
                 sync_tray_title_from_response(&app, &response);
                 return Ok(response);
@@ -1169,6 +1196,10 @@ async fn refresh_collected_usage_snapshot(
         eprintln!("lilimit collector warning: {error_summary}");
         response.error = Some(error_summary);
     }
+    // A forced refresh can come from the settings window, which the widget
+    // window can't observe; push the fresh snapshot so it doesn't keep showing
+    // stale data until its next poll tick.
+    let _ = app.emit_to("main", "usage-changed", &response);
     Ok(response)
 }
 
@@ -1393,17 +1424,26 @@ async fn fetch_codex_provider(client: &reqwest::Client) -> Result<ProviderUsage,
         save_codex_credentials(&credentials).map_err(UsageFetchError::Message)?;
     }
 
-    match fetch_codex_usage(client, &credentials).await {
-        Ok(response) => Ok(codex_provider_from_usage(response)),
+    let response = match fetch_codex_usage(client, &credentials).await {
+        Ok(response) => response,
         Err(UsageFetchError::Unauthorized) if !credentials.refresh_token.is_empty() => {
             let refreshed = refresh_codex_credentials(client, &credentials).await?;
             save_codex_credentials(&refreshed).map_err(UsageFetchError::Message)?;
-            fetch_codex_usage(client, &refreshed)
-                .await
-                .map(codex_provider_from_usage)
+            fetch_codex_usage(client, &refreshed).await?
         }
-        Err(error) => Err(error),
-    }
+        Err(error) => return Err(error),
+    };
+
+    // Reading Codex's local session logs walks the filesystem and parses JSONL;
+    // keep that off the async runtime's worker threads, like the Claude path.
+    // On Linux (no CodexBar cache) this fallback runs on every refresh.
+    let local_usage = tauri::async_runtime::spawn_blocking(load_codex_local_token_usage)
+        .await
+        .map_err(|error| UsageFetchError::Message(error.to_string()))?;
+    Ok(codex_provider_from_usage_with_local_usage(
+        response,
+        local_usage,
+    ))
 }
 
 fn load_codex_credentials() -> Result<CodexCredentials, String> {
@@ -1623,7 +1663,10 @@ fn codex_config_chatgpt_base_url() -> Option<String> {
     None
 }
 
-fn codex_provider_from_usage(response: CodexUsageApiResponse) -> ProviderUsage {
+fn codex_provider_from_usage_with_local_usage(
+    response: CodexUsageApiResponse,
+    local_usage: Option<(Option<TokenUsageSummary>, Vec<DailyUsagePoint>)>,
+) -> ProviderUsage {
     let primary_raw = response
         .rate_limit
         .as_ref()
@@ -1648,7 +1691,6 @@ fn codex_provider_from_usage(response: CodexUsageApiResponse) -> ProviderUsage {
         .as_ref()
         .and_then(|window| window.reset_description.clone())
         .unwrap_or_default();
-    let local_usage = load_codex_local_token_usage();
     let (token_usage, daily_usage) = local_usage.unwrap_or((None, Vec::new()));
 
     ProviderUsage {
@@ -1912,6 +1954,67 @@ fn summarize_local_token_usage(
     Some((Some(token_usage), daily_usage))
 }
 
+// Session transcripts are append-only and the scans above re-run on every
+// refresh tick (every tick on Linux, where no CodexBar cache exists), so
+// re-parsing every line of a month of JSONL each time wastes CPU and disk.
+// Cache each file's parsed entries keyed by (modified, size) and only re-parse
+// files that changed. Entries are cached without a date filter — the 30-day
+// window shifts daily — and filtered per-entry at merge time.
+struct ScanFileCache<T> {
+    modified: Option<SystemTime>,
+    size: u64,
+    entries: Vec<T>,
+}
+
+fn cached_file_entries<'cache, T>(
+    cache: &'cache mut HashMap<PathBuf, ScanFileCache<T>>,
+    path: &Path,
+    parse: fn(&Path) -> Vec<T>,
+) -> &'cache [T] {
+    let (modified, size) = fs::metadata(path)
+        .map(|metadata| (metadata.modified().ok(), metadata.len()))
+        .unwrap_or((None, 0));
+    let fresh = modified.is_some()
+        && cache
+            .get(path)
+            .is_some_and(|entry| entry.modified == modified && entry.size == size);
+    if !fresh {
+        let entries = parse(path);
+        cache.insert(
+            path.to_path_buf(),
+            ScanFileCache {
+                modified,
+                size,
+                entries,
+            },
+        );
+    }
+    cache
+        .get(path)
+        .map(|entry| entry.entries.as_slice())
+        .unwrap_or(&[])
+}
+
+// Drop cache entries for files that fell out of the scan window (or were
+// deleted) so the cache can't grow without bound. `files` must be sorted.
+fn prune_scan_cache<T>(cache: &mut HashMap<PathBuf, ScanFileCache<T>>, files: &[PathBuf]) {
+    cache.retain(|path, _| files.binary_search(path).is_ok());
+}
+
+#[derive(Clone)]
+struct CodexUsageRecord {
+    day_key: String,
+    model: String,
+    tokens: i64,
+    cost: Option<f64>,
+}
+
+fn codex_scan_cache() -> &'static Mutex<HashMap<PathBuf, ScanFileCache<CodexUsageRecord>>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, ScanFileCache<CodexUsageRecord>>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn scan_codex_session_logs(
     since: NaiveDate,
     until: NaiveDate,
@@ -1922,12 +2025,32 @@ fn scan_codex_session_logs(
         return;
     };
     let mut files = Vec::new();
+    // A session started before midnight keeps appending lines after it, so
+    // admit files dated one day before the window; the per-record day filter
+    // below drops anything still out of range.
+    let file_since = since.pred_opt().unwrap_or(since);
     // Sessions live at sessions/YYYY/MM/DD/rollout-*.jsonl; the depth cap just
     // guards against symlink cycles.
-    collect_codex_session_files(&root, since, until, &mut files, 8);
+    collect_codex_session_files(&root, file_since, until, &mut files, 8);
     files.sort();
-    for path in files {
-        scan_codex_session_file(&path, since, until, days, models);
+    let mut cache = codex_scan_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    prune_scan_cache(&mut cache, &files);
+    for path in &files {
+        for record in cached_file_entries(&mut cache, path, scan_codex_session_file) {
+            if !day_key_in_range(&record.day_key, since, until) {
+                continue;
+            }
+            record_daily_usage(
+                days,
+                models,
+                &record.day_key,
+                &record.model,
+                record.tokens,
+                record.cost,
+            );
+        }
     }
 }
 
@@ -1964,15 +2087,10 @@ fn collect_codex_session_files(
     }
 }
 
-fn scan_codex_session_file(
-    path: &Path,
-    since: NaiveDate,
-    until: NaiveDate,
-    days: &mut BTreeMap<String, LocalDayUsage>,
-    models: &mut HashMap<String, LocalModelUsage>,
-) {
+fn scan_codex_session_file(path: &Path) -> Vec<CodexUsageRecord> {
+    let mut records = Vec::new();
     let Ok(file) = fs::File::open(path) else {
-        return;
+        return records;
     };
     let reader = BufReader::new(file);
     let mut current_model = String::new();
@@ -2006,7 +2124,6 @@ fn scan_codex_session_file(
         let Some(day_key) = local_day_key_from_timestamp(timestamp) else {
             continue;
         };
-        let day_in_range = day_key_in_range(&day_key, since, until);
         let info = payload.get("info").filter(|value| !value.is_null());
         let total = info
             .and_then(|info| info.get("total_token_usage"))
@@ -2028,19 +2145,18 @@ fn scan_codex_session_file(
             continue;
         };
 
-        if !day_in_range || current_model.is_empty() || delta.total_tokens() <= 0 {
+        if current_model.is_empty() || delta.total_tokens() <= 0 {
             continue;
         }
         let cost = codex_cost_usd(&current_model, delta.input, delta.cached, delta.output);
-        record_daily_usage(
-            days,
-            models,
-            &day_key,
-            &current_model,
-            delta.total_tokens(),
+        records.push(CodexUsageRecord {
+            day_key,
+            model: current_model.clone(),
+            tokens: delta.total_tokens(),
             cost,
-        );
+        });
     }
+    records
 }
 
 fn codex_session_file_date(path: &Path) -> Option<NaiveDate> {
@@ -2057,6 +2173,12 @@ fn claude_projects_dir() -> Option<PathBuf> {
     Some(home_dir().ok()?.join(".claude").join("projects"))
 }
 
+fn claude_scan_cache() -> &'static Mutex<HashMap<PathBuf, ScanFileCache<ClaudeUsageEntry>>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, ScanFileCache<ClaudeUsageEntry>>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn scan_claude_session_logs(
     since: NaiveDate,
     until: NaiveDate,
@@ -2069,6 +2191,10 @@ fn scan_claude_session_logs(
     let mut files = Vec::new();
     collect_claude_session_files(&root, since, &mut files, 8);
     files.sort();
+    let mut cache = claude_scan_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    prune_scan_cache(&mut cache, &files);
     // Claude Code logs each assistant turn several times while it streams: the
     // early lines carry placeholder usage (a tiny output_tokens count) and a
     // later line carries the final totals, all under the same (message.id,
@@ -2076,8 +2202,9 @@ fn scan_claude_session_logs(
     // files. Keep one entry per id — the one with the largest total, i.e. the
     // final line — so we neither double count nor keep a partial placeholder.
     let mut best: HashMap<String, ClaudeUsageEntry> = HashMap::new();
-    for path in files {
-        scan_claude_session_file(&path, since, until, days, models, &mut best);
+    for path in &files {
+        let entries = cached_file_entries(&mut cache, path, scan_claude_session_file);
+        merge_claude_usage_entries(entries, since, until, days, models, &mut best);
     }
     for entry in best.into_values() {
         record_daily_usage(
@@ -2088,6 +2215,42 @@ fn scan_claude_session_logs(
             entry.tokens,
             entry.cost,
         );
+    }
+}
+
+fn merge_claude_usage_entries(
+    entries: &[ClaudeUsageEntry],
+    since: NaiveDate,
+    until: NaiveDate,
+    days: &mut BTreeMap<String, LocalDayUsage>,
+    models: &mut HashMap<String, LocalModelUsage>,
+    best: &mut HashMap<String, ClaudeUsageEntry>,
+) {
+    for entry in entries {
+        if !day_key_in_range(&entry.day_key, since, until) {
+            continue;
+        }
+        match entry.dedup_key.as_ref() {
+            // Keyed lines are deduped globally; keep the largest (final) total.
+            Some(key) => {
+                let replace = match best.get(key) {
+                    Some(existing) => entry.tokens > existing.tokens,
+                    None => true,
+                };
+                if replace {
+                    best.insert(key.clone(), entry.clone());
+                }
+            }
+            // Without ids we can't dedupe, so count each line as it arrives.
+            None => record_daily_usage(
+                days,
+                models,
+                &entry.day_key,
+                &entry.model,
+                entry.tokens,
+                entry.cost,
+            ),
+        }
     }
 }
 
@@ -2134,46 +2297,23 @@ fn claude_session_file_in_range(path: &Path, since: NaiveDate) -> bool {
     modified.with_timezone(&Local).date_naive() >= since
 }
 
-fn scan_claude_session_file(
-    path: &Path,
-    since: NaiveDate,
-    until: NaiveDate,
-    days: &mut BTreeMap<String, LocalDayUsage>,
-    models: &mut HashMap<String, LocalModelUsage>,
-    best: &mut HashMap<String, ClaudeUsageEntry>,
-) {
+fn scan_claude_session_file(path: &Path) -> Vec<ClaudeUsageEntry> {
+    let mut entries = Vec::new();
     let Ok(file) = fs::File::open(path) else {
-        return;
+        return entries;
     };
     let reader = BufReader::new(file);
     for line in reader.lines().map_while(Result::ok) {
-        let Some(entry) = parse_claude_usage_line(&line, since, until) else {
-            continue;
-        };
-        match entry.dedup_key.clone() {
-            // Keyed lines are deduped globally; keep the largest (final) total.
-            Some(key) => {
-                let replace = match best.get(&key) {
-                    Some(existing) => entry.tokens > existing.tokens,
-                    None => true,
-                };
-                if replace {
-                    best.insert(key, entry);
-                }
-            }
-            // Without ids we can't dedupe, so count each line as it arrives.
-            None => record_daily_usage(
-                days,
-                models,
-                &entry.day_key,
-                &entry.model,
-                entry.tokens,
-                entry.cost,
-            ),
+        // Parse with an open date range: the caller caches these entries across
+        // refresh ticks and applies the (shifting) 30-day window itself.
+        if let Some(entry) = parse_claude_usage_line(&line, NaiveDate::MIN, NaiveDate::MAX) {
+            entries.push(entry);
         }
     }
+    entries
 }
 
+#[derive(Clone)]
 struct ClaudeUsageEntry {
     day_key: String,
     model: String,
@@ -3507,6 +3647,10 @@ fn reapply_widget_scale(app: AppHandle) {
 // toward the bottom-right grip the pointer is dragging.
 #[tauri::command]
 fn preview_widget_scale(app: AppHandle, scale: f64) {
+    // A drag that ended within the last 500ms may still be waiting on the
+    // debounced position write; flush it so the stale on-disk position can't
+    // snap the window back mid-resize (apply_window_settings prefers it).
+    flush_pending_window_position(app.state::<Arc<PendingWindowPosition>>().inner());
     let mut settings = read_widget_settings().unwrap_or_default();
     settings.scale = clamp_scale(scale);
     if let Some(window) = app.get_webview_window("main") {
@@ -3519,6 +3663,7 @@ fn preview_widget_scale(app: AppHandle, scale: f64) {
 // window's stepper readout and the tray catch up. Runs once on pointer-up.
 #[tauri::command]
 fn commit_widget_scale(app: AppHandle, scale: f64) -> Result<(), String> {
+    flush_pending_window_position(app.state::<Arc<PendingWindowPosition>>().inner());
     let mut settings = read_widget_settings().unwrap_or_default();
     settings.scale = clamp_scale(scale);
     if let Some(window) = app.get_webview_window("main") {
@@ -3905,7 +4050,7 @@ mod tests {
           "credits": { "balance": "12.5" }
         }"#;
         let response: CodexUsageApiResponse = serde_json::from_str(json).unwrap();
-        let provider = codex_provider_from_usage(response);
+        let provider = codex_provider_from_usage_with_local_usage(response, None);
 
         assert_eq!(provider.name, "Codex");
         assert_eq!(provider.account_email.as_deref(), Some("dev@example.com"));
@@ -4423,8 +4568,10 @@ mod tests {
         let mut days: BTreeMap<String, LocalDayUsage> = BTreeMap::new();
         let mut models: HashMap<String, LocalModelUsage> = HashMap::new();
         let mut best: HashMap<String, ClaudeUsageEntry> = HashMap::new();
-        scan_claude_session_file(&file_a, since, until, &mut days, &mut models, &mut best);
-        scan_claude_session_file(&file_b, since, until, &mut days, &mut models, &mut best);
+        let entries_a = scan_claude_session_file(&file_a);
+        let entries_b = scan_claude_session_file(&file_b);
+        merge_claude_usage_entries(&entries_a, since, until, &mut days, &mut models, &mut best);
+        merge_claude_usage_entries(&entries_b, since, until, &mut days, &mut models, &mut best);
         for entry in best.into_values() {
             record_daily_usage(
                 &mut days,

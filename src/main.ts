@@ -757,8 +757,11 @@ function renderHistory(points: DailyUsagePoint[], color: string): string {
   }
 
   // Chart a single metric: mixing dollars and token counts in one scale
-  // makes the cost bars invisible next to million-token days.
-  const hasCost = visiblePoints.some((point) => point.costUSD !== null);
+  // makes the cost bars invisible next to million-token days. Only chart cost
+  // when every visible day has it — in a mixed series (e.g. days on a model
+  // missing from the pricing table) the token-only days would render as
+  // empty stubs despite real usage.
+  const hasCost = visiblePoints.every((point) => point.costUSD !== null);
   const values = visiblePoints.map((point) =>
     hasCost ? (point.costUSD ?? 0) : (point.totalTokens ?? 0),
   );
@@ -1174,6 +1177,12 @@ function bindResizeGrip(surface: HTMLElement): void {
     // screen coordinates stay stable while the window itself resizes mid-drag.
     resizeStart = { x: event.screenX, y: event.screenY, scale: clampScale(currentSettings.scale) };
     resizePending = null;
+    // If capture failed (or WebKitGTK drops it while the native window resizes
+    // mid-drag), the release can land outside the grip and never reach it.
+    // Without a fallback, resizeStart would stay set and defer every future
+    // render, freezing the widget. finish() removes these again.
+    window.addEventListener("pointerup", finish);
+    window.addEventListener("pointercancel", finish);
   });
 
   grip.addEventListener("pointermove", (event) => {
@@ -1195,6 +1204,8 @@ function bindResizeGrip(surface: HTMLElement): void {
   });
 
   const finish = (event: PointerEvent): void => {
+    window.removeEventListener("pointerup", finish);
+    window.removeEventListener("pointercancel", finish);
     if (!resizeStart) {
       return;
     }
@@ -1364,8 +1375,9 @@ async function refreshUsage(manual = false): Promise<void> {
   renderCurrent();
 
   try {
+    let collected: UsageSnapshot | null = null;
     try {
-      const collected = await invoke<UsageSnapshot>("refresh_collected_usage_snapshot", {
+      collected = await invoke<UsageSnapshot>("refresh_collected_usage_snapshot", {
         force: manual,
       });
       collectionError = collected.error;
@@ -1381,7 +1393,9 @@ async function refreshUsage(manual = false): Promise<void> {
       }
     }
 
-    latestSnapshot = await invoke<UsageSnapshot>("get_usage_snapshot");
+    // The refresh already returns the parsed snapshot; re-read the file only
+    // when the refresh itself failed (e.g. no credentials, corrupt state).
+    latestSnapshot = collected ?? (await invoke<UsageSnapshot>("get_usage_snapshot"));
   } catch (error) {
     latestSnapshot = errorSnapshot(error);
   } finally {
@@ -1410,6 +1424,23 @@ async function initialize(): Promise<void> {
     bindSettingsWindowShortcuts();
     renderSettingsWindow();
     return;
+  }
+
+  try {
+    // Collections triggered elsewhere (the settings window's "Refresh now")
+    // push their result here; without this the widget would keep rendering
+    // the old snapshot until its next poll tick.
+    await listen<UsageSnapshot>("usage-changed", (event) => {
+      if (refreshInProgress) {
+        // Our own refresh triggered this collection; it renders on completion.
+        return;
+      }
+      latestSnapshot = event.payload;
+      collectionError = event.payload.error;
+      renderCurrent();
+    });
+  } catch {
+    // Non-fatal: the periodic poll still refreshes the widget.
   }
 
   renderLoading();
