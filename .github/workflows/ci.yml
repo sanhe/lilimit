@@ -82,6 +82,41 @@ jobs:
         working-directory: src-tauri
         run: cargo test --locked
 
+  # release-linux.yml builds on ubuntu-22.04 for glibc compatibility, so
+  # validate that environment here instead of first finding out on a tag.
+  # fmt/clippy are OS-independent and already covered by the 24.04 job.
+  cargo-ubuntu-2204:
+    name: cargo (ubuntu-22.04)
+    runs-on: ubuntu-22.04
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Tauri Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            libayatana-appindicator3-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            pkg-config
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo build
+        working-directory: src-tauri
+        run: cargo build --locked
+
+      - name: Cargo test
+        working-directory: src-tauri
+        run: cargo test --locked
+
   # The macOS-only code paths (Keychain read, CodexBar caches, tray text)
   # never compile on the Linux job, so build and test them here too.
   cargo-macos:
