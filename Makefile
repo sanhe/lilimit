@@ -1,4 +1,4 @@
-.PHONY: install dev tauri-dev typecheck rust-check rust-build rust-test secret-scan check ci analyze build tauri-build clean
+.PHONY: install dev tauri-dev typecheck rust-fmt-check rust-clippy rust-check rust-build rust-test secret-scan check ci analyze build tauri-build clean
 
 install:
 	pnpm install
@@ -10,6 +10,12 @@ tauri-dev:
 
 typecheck:
 	pnpm typecheck
+
+rust-fmt-check:
+	cd src-tauri && cargo fmt --check
+
+rust-clippy:
+	cd src-tauri && cargo clippy --locked --all-targets -- -D warnings
 
 rust-check:
 	cd src-tauri && cargo check --locked
@@ -25,11 +31,11 @@ secret-scan:
 		echo "gitleaks is not installed. Install it from https://github.com/gitleaks/gitleaks."; \
 		exit 127; \
 	fi
-	gitleaks git --config .gitleaks.toml --redact .
+	gitleaks git --config .gitleaks.toml --redact --log-opts="--all" .
 
 check: typecheck rust-check rust-test
 
-ci: build rust-check rust-build rust-test
+ci: build rust-fmt-check rust-clippy rust-check rust-build rust-test
 
 analyze: ci secret-scan
 

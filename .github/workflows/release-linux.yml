@@ -15,8 +15,30 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Publishing the draft release created by a workflow_dispatch run pushes its
+  # lilimit-v* tag, which matches this workflow's own tag triggers and would
+  # build a duplicate release. Skip tag pushes whose release already exists.
+  guard:
+    name: guard against release re-runs
+    runs-on: ubuntu-24.04
+    outputs:
+      skip: ${{ steps.release-exists.outputs.skip }}
+    steps:
+      - name: Check for an existing release
+        id: release-exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          skip=false
+          if [ "${{ github.ref_type }}" = "tag" ] && gh release view "${{ github.ref_name }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            skip=true
+          fi
+          echo "skip=${skip}" >> "$GITHUB_OUTPUT"
+
   ubuntu:
     name: ubuntu packages
+    needs: guard
+    if: needs.guard.outputs.skip != 'true'
     runs-on: ubuntu-22.04
     env:
       APPIMAGE_EXTRACT_AND_RUN: 1
