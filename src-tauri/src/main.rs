@@ -1867,57 +1867,72 @@ fn codexbar_cost_cache_dir() -> Option<PathBuf> {
     }
 }
 
-fn load_codex_local_token_usage() -> Option<(Option<TokenUsageSummary>, Vec<DailyUsagePoint>)> {
-    let today = Local::now().date_naive();
-    let since = today.checked_sub_days(Days::new(29)).unwrap_or(today);
-    let mut days: BTreeMap<String, LocalDayUsage> = BTreeMap::new();
-    let mut models: HashMap<String, LocalModelUsage> = HashMap::new();
+type MergeCostCacheFn<Cache> = fn(
+    Cache,
+    NaiveDate,
+    NaiveDate,
+    &mut BTreeMap<String, LocalDayUsage>,
+    &mut HashMap<String, LocalModelUsage>,
+);
 
-    if let Some(cache_dir) = codexbar_cost_cache_dir() {
-        if let Some(cache) = read_json_file::<CodexBarCostCache>(&cache_dir.join("codex-v7.json")) {
-            merge_codexbar_cost_cache(cache, since, today, &mut days, &mut models);
-        }
+type ScanSessionLogsFn = fn(
+    NaiveDate,
+    NaiveDate,
+    &mut BTreeMap<String, LocalDayUsage>,
+    &mut HashMap<String, LocalModelUsage>,
+);
 
-        if let Some(cache) =
-            read_json_file::<PiSessionCostCache>(&cache_dir.join("pi-sessions-v2.json"))
-        {
-            merge_pi_session_cost_cache(cache, since, today, &mut days, &mut models);
-        }
-    }
-
-    if days.is_empty() {
-        scan_codex_session_logs(since, today, &mut days, &mut models);
-    }
-
-    summarize_local_token_usage(&days, &models)
-}
-
-fn load_claude_local_token_usage() -> Option<(Option<TokenUsageSummary>, Vec<DailyUsagePoint>)> {
+// Codex and Claude local usage load the same way over the same 30-day window;
+// only the CodexBar cache file, the merge fns, and the session-log scanner
+// differ per provider.
+fn load_local_token_usage(
+    cost_cache_file: &str,
+    merge_cost_cache: MergeCostCacheFn<CodexBarCostCache>,
+    merge_pi_cache: MergeCostCacheFn<PiSessionCostCache>,
+    scan_session_logs: ScanSessionLogsFn,
+) -> Option<(Option<TokenUsageSummary>, Vec<DailyUsagePoint>)> {
     let today = Local::now().date_naive();
     let since = today.checked_sub_days(Days::new(29)).unwrap_or(today);
     let mut days: BTreeMap<String, LocalDayUsage> = BTreeMap::new();
     let mut models: HashMap<String, LocalModelUsage> = HashMap::new();
 
     // CodexBar's cost caches only exist on macOS. Everywhere else (and on macOS
-    // when CodexBar isn't installed) fall back to Claude Code's own session logs.
+    // when CodexBar isn't installed) fall back to the CLI's own session logs.
     if let Some(cache_dir) = codexbar_cost_cache_dir() {
-        if let Some(cache) = read_json_file::<CodexBarCostCache>(&cache_dir.join("claude-v2.json"))
-        {
-            merge_claude_cost_cache(cache, since, today, &mut days, &mut models);
+        if let Some(cache) = read_json_file::<CodexBarCostCache>(&cache_dir.join(cost_cache_file)) {
+            merge_cost_cache(cache, since, today, &mut days, &mut models);
         }
 
         if let Some(cache) =
             read_json_file::<PiSessionCostCache>(&cache_dir.join("pi-sessions-v2.json"))
         {
-            merge_pi_claude_cost_cache(cache, since, today, &mut days, &mut models);
+            merge_pi_cache(cache, since, today, &mut days, &mut models);
         }
     }
 
     if days.is_empty() {
-        scan_claude_session_logs(since, today, &mut days, &mut models);
+        scan_session_logs(since, today, &mut days, &mut models);
     }
 
     summarize_local_token_usage(&days, &models)
+}
+
+fn load_codex_local_token_usage() -> Option<(Option<TokenUsageSummary>, Vec<DailyUsagePoint>)> {
+    load_local_token_usage(
+        "codex-v7.json",
+        merge_codexbar_cost_cache,
+        merge_pi_session_cost_cache,
+        scan_codex_session_logs,
+    )
+}
+
+fn load_claude_local_token_usage() -> Option<(Option<TokenUsageSummary>, Vec<DailyUsagePoint>)> {
+    load_local_token_usage(
+        "claude-v2.json",
+        merge_claude_cost_cache,
+        merge_pi_claude_cost_cache,
+        scan_claude_session_logs,
+    )
 }
 
 fn summarize_local_token_usage(
@@ -2029,9 +2044,12 @@ fn scan_codex_session_logs(
     // admit files dated one day before the window; the per-record day filter
     // below drops anything still out of range.
     let file_since = since.pred_opt().unwrap_or(since);
-    // Sessions live at sessions/YYYY/MM/DD/rollout-*.jsonl; the depth cap just
-    // guards against symlink cycles.
-    collect_codex_session_files(&root, file_since, until, &mut files, 8);
+    // Sessions live at sessions/YYYY/MM/DD/rollout-*.jsonl.
+    collect_session_files(&root, &mut files, 8, &|path: &Path| {
+        codex_session_file_date(path)
+            .map(|date| date >= file_since && date <= until)
+            .unwrap_or(false)
+    });
     files.sort();
     let mut cache = codex_scan_cache()
         .lock()
@@ -2054,12 +2072,13 @@ fn scan_codex_session_logs(
     }
 }
 
-fn collect_codex_session_files(
+// Recursively collect the .jsonl files under `root` that pass `include`; the
+// depth cap just guards against symlink cycles.
+fn collect_session_files<F: Fn(&Path) -> bool>(
     root: &Path,
-    since: NaiveDate,
-    until: NaiveDate,
     files: &mut Vec<PathBuf>,
     max_depth: usize,
+    include: &F,
 ) {
     let Some(remaining_depth) = max_depth.checked_sub(1) else {
         return;
@@ -2071,17 +2090,14 @@ fn collect_codex_session_files(
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            collect_codex_session_files(&path, since, until, files, remaining_depth);
+            collect_session_files(&path, files, remaining_depth, include);
             continue;
         }
 
         if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
             continue;
         }
-        if codex_session_file_date(&path)
-            .map(|date| date >= since && date <= until)
-            .unwrap_or(false)
-        {
+        if include(&path) {
             files.push(path);
         }
     }
@@ -2189,7 +2205,9 @@ fn scan_claude_session_logs(
         return;
     };
     let mut files = Vec::new();
-    collect_claude_session_files(&root, since, &mut files, 8);
+    collect_session_files(&root, &mut files, 8, &|path: &Path| {
+        claude_session_file_in_range(path, since)
+    });
     files.sort();
     let mut cache = claude_scan_cache()
         .lock()
@@ -2254,38 +2272,9 @@ fn merge_claude_usage_entries(
     }
 }
 
-fn collect_claude_session_files(
-    root: &Path,
-    since: NaiveDate,
-    files: &mut Vec<PathBuf>,
-    max_depth: usize,
-) {
-    let Some(remaining_depth) = max_depth.checked_sub(1) else {
-        return;
-    };
-    let Ok(entries) = fs::read_dir(root) else {
-        return;
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_claude_session_files(&path, since, files, remaining_depth);
-            continue;
-        }
-
-        if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
-            continue;
-        }
-        // Filenames are session UUIDs, not dates, so bound the work by the file's
-        // last-modified time: a file untouched since before the window can't hold
-        // any in-range lines. Per-line timestamps still gate what we count.
-        if claude_session_file_in_range(&path, since) {
-            files.push(path);
-        }
-    }
-}
-
+// Filenames are session UUIDs, not dates, so bound the work by the file's
+// last-modified time: a file untouched since before the window can't hold
+// any in-range lines. Per-line timestamps still gate what we count.
 fn claude_session_file_in_range(path: &Path, since: NaiveDate) -> bool {
     let Ok(metadata) = fs::metadata(path) else {
         return true;
@@ -2465,23 +2454,24 @@ fn merge_codexbar_cost_cache(
     }
 }
 
-fn merge_pi_session_cost_cache(
-    cache: PiSessionCostCache,
+// Shared body of the per-provider pi-sessions merges: they differ only in the
+// model normalizer and the pricing fallback used when a row's cached cost is
+// incomplete.
+fn merge_pi_provider_days(
+    provider_days: &HashMap<String, HashMap<String, PiPackedUsage>>,
+    normalize_model: fn(&str) -> String,
+    estimate_cost: fn(&str, &PiPackedUsage) -> Option<f64>,
     since: NaiveDate,
     until: NaiveDate,
     days: &mut BTreeMap<String, LocalDayUsage>,
     models: &mut HashMap<String, LocalModelUsage>,
 ) {
-    let Some(provider_days) = cache.days_by_provider.get("codex") else {
-        return;
-    };
-
     for (day_key, model_values) in provider_days {
         if !day_key_in_range(day_key, since, until) {
             continue;
         }
         for (raw_model, packed) in model_values {
-            let model = normalize_codex_model(raw_model);
+            let model = normalize_model(raw_model);
             let derived_tokens = packed
                 .input_tokens
                 .saturating_add(packed.cache_read_tokens)
@@ -2494,20 +2484,43 @@ fn merge_pi_session_cost_cache(
             let cost = if has_complete_cached_cost {
                 Some(packed.cost_nanos as f64 / 1_000_000_000.0)
             } else {
-                codex_cost_usd(
-                    &model,
-                    packed
-                        .input_tokens
-                        .saturating_add(packed.cache_read_tokens)
-                        .saturating_add(packed.cache_write_tokens),
-                    packed.cache_read_tokens,
-                    packed.output_tokens,
-                )
+                estimate_cost(&model, packed)
             };
 
             record_daily_usage(days, models, day_key, &model, tokens, cost);
         }
     }
+}
+
+fn merge_pi_session_cost_cache(
+    cache: PiSessionCostCache,
+    since: NaiveDate,
+    until: NaiveDate,
+    days: &mut BTreeMap<String, LocalDayUsage>,
+    models: &mut HashMap<String, LocalModelUsage>,
+) {
+    let Some(provider_days) = cache.days_by_provider.get("codex") else {
+        return;
+    };
+    merge_pi_provider_days(
+        provider_days,
+        normalize_codex_model,
+        |model, packed| {
+            codex_cost_usd(
+                model,
+                packed
+                    .input_tokens
+                    .saturating_add(packed.cache_read_tokens)
+                    .saturating_add(packed.cache_write_tokens),
+                packed.cache_read_tokens,
+                packed.output_tokens,
+            )
+        },
+        since,
+        until,
+        days,
+        models,
+    );
 }
 
 fn merge_claude_cost_cache(
@@ -2557,37 +2570,23 @@ fn merge_pi_claude_cost_cache(
     let Some(provider_days) = cache.days_by_provider.get("claude") else {
         return;
     };
-
-    for (day_key, model_values) in provider_days {
-        if !day_key_in_range(day_key, since, until) {
-            continue;
-        }
-        for (raw_model, packed) in model_values {
-            let model = normalize_claude_model(raw_model);
-            let derived_tokens = packed
-                .input_tokens
-                .saturating_add(packed.cache_read_tokens)
-                .saturating_add(packed.cache_write_tokens)
-                .saturating_add(packed.output_tokens);
-            let tokens = packed.total_tokens.max(derived_tokens).max(0);
-            let has_complete_cached_cost = packed
-                .usage_sample_count
-                .is_some_and(|count| count > 0 && count == packed.cost_sample_count);
-            let cost = if has_complete_cached_cost {
-                Some(packed.cost_nanos as f64 / 1_000_000_000.0)
-            } else {
-                claude_cost_usd(
-                    &model,
-                    packed.input_tokens,
-                    packed.cache_read_tokens,
-                    packed.cache_write_tokens,
-                    packed.output_tokens,
-                )
-            };
-
-            record_daily_usage(days, models, day_key, &model, tokens, cost);
-        }
-    }
+    merge_pi_provider_days(
+        provider_days,
+        normalize_claude_model,
+        |model, packed| {
+            claude_cost_usd(
+                model,
+                packed.input_tokens,
+                packed.cache_read_tokens,
+                packed.cache_write_tokens,
+                packed.output_tokens,
+            )
+        },
+        since,
+        until,
+        days,
+        models,
+    );
 }
 
 fn record_local_usage(
@@ -3681,6 +3680,51 @@ fn commit_widget_scale(app: AppHandle, scale: f64) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BaseWindowSize {
+    width: f64,
+    height: f64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ScaleBounds {
+    min_scale: f64,
+    max_scale: f64,
+    base_window_size: BaseWindowSizes,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BaseWindowSizes {
+    simple: BaseWindowSize,
+    full: BaseWindowSize,
+}
+
+// The frontend needs these for its stepper limits and resize-grip drag math.
+// Serving them from the backend constants (rather than mirroring them in TS)
+// keeps the two sides from drifting.
+#[tauri::command]
+fn get_scale_bounds() -> ScaleBounds {
+    let (simple_width, simple_height) = base_window_size(DisplayMode::Simple);
+    let (full_width, full_height) = base_window_size(DisplayMode::Full);
+    ScaleBounds {
+        min_scale: MIN_SCALE,
+        max_scale: MAX_SCALE,
+        base_window_size: BaseWindowSizes {
+            simple: BaseWindowSize {
+                width: simple_width,
+                height: simple_height,
+            },
+            full: BaseWindowSize {
+                width: full_width,
+                height: full_height,
+            },
+        },
+    }
+}
+
 fn sync_tray_title_from_response(app: &AppHandle, response: &UsageSnapshotResponse) {
     let settings = read_widget_settings().unwrap_or_default();
     if response.status == "ready" {
@@ -4020,7 +4064,8 @@ fn main() {
             hide_widget_window,
             reapply_widget_scale,
             preview_widget_scale,
-            commit_widget_scale
+            commit_widget_scale,
+            get_scale_bounds
         ])
         .run(tauri::generate_context!())
         .expect("failed to run lilimit");

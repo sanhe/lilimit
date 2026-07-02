@@ -85,19 +85,26 @@ type UsageSnapshot = {
 
 const REFRESH_MS = 5 * 60 * 1000;
 const STALE_MS = 15 * 60 * 1000;
-// Mirrors the MIN_SCALE/MAX_SCALE the Rust backend clamps to; the actual
-// scaling is applied natively (window resize + webview zoom) by the backend.
-// SCALE_STEP is the stepper-button increment; the resize grip varies the scale
-// continuously between whole-percent values.
-const MIN_SCALE = 0.8;
-const MAX_SCALE = 2;
+// Startup mirrors of the scale bounds the Rust backend clamps to and the base
+// (100%) window size per display mode (used to translate resize-grip drag
+// distance into a scale delta that feels 1:1). initialize() replaces them with
+// the authoritative values from get_scale_bounds so the two sides can't drift;
+// the actual scaling is applied natively (window resize + webview zoom) by the
+// backend. SCALE_STEP is the stepper-button increment; the resize grip varies
+// the scale continuously between whole-percent values.
+let MIN_SCALE = 0.8;
+let MAX_SCALE = 2;
 const SCALE_STEP = 0.1;
 const DEFAULT_SCALE = 1;
-// Base (100%) window size per display mode, mirroring the Rust backend. Used to
-// translate resize-grip drag distance into a scale delta that feels 1:1.
-const BASE_WINDOW_SIZE: Record<DisplayMode, { width: number; height: number }> = {
+let BASE_WINDOW_SIZE: Record<DisplayMode, { width: number; height: number }> = {
   simple: { width: 280, height: 140 },
   full: { width: 360, height: 560 },
+};
+
+type ScaleBounds = {
+  minScale: number;
+  maxScale: number;
+  baseWindowSize: Record<DisplayMode, { width: number; height: number }>;
 };
 const DEFAULT_SETTINGS: WidgetSettings = {
   displayMode: "simple",
@@ -684,8 +691,21 @@ function localDayKey(date = new Date()): string {
   return `${year}-${month}-${day}`;
 }
 
-function latestDailyUsage(points: DailyUsagePoint[]): DailyUsagePoint | null {
-  return points.length > 0 ? points[points.length - 1] : null;
+// Newest-day usage shared by the metrics grid and the Claude cost summary: the
+// last daily point when present, falling back to the session totals. isToday
+// picks between the "Today" and "Latest" style labels.
+function latestUsageSummary(provider: ProviderUsage): {
+  cost: number | null;
+  tokens: number | null;
+  isToday: boolean;
+} {
+  const points = provider.dailyUsage;
+  const latest = points.length > 0 ? points[points.length - 1] : null;
+  return {
+    cost: latest?.costUSD ?? provider.tokenUsage?.sessionCostUSD ?? null,
+    tokens: latest?.totalTokens ?? provider.tokenUsage?.sessionTokens ?? null,
+    isToday: latest?.dayKey === localDayKey(),
+  };
 }
 
 function renderTokenMetrics(provider: ProviderUsage): string {
@@ -694,17 +714,15 @@ function renderTokenMetrics(provider: ProviderUsage): string {
     return "";
   }
 
-  const latest = latestDailyUsage(provider.dailyUsage);
-  const latestCost = latest?.costUSD ?? tokenUsage.sessionCostUSD;
-  const latestTokens = latest?.totalTokens ?? tokenUsage.sessionTokens;
-  const latestCostTitle = latest?.dayKey === localDayKey() ? "Today" : "Latest cost";
+  const latest = latestUsageSummary(provider);
+  const latestCostTitle = latest.isToday ? "Today" : "Latest cost";
 
   return `
     <div class="metrics">
-      ${renderMetric(latestCostTitle, formatUsd(latestCost))}
+      ${renderMetric(latestCostTitle, formatUsd(latest.cost))}
       ${renderMetric("30d cost", formatUsd(tokenUsage.last30DaysCostUSD))}
       ${renderMetric("30d tokens", formatTokens(tokenUsage.last30DaysTokens))}
-      ${renderMetric("Latest tokens", formatTokens(latestTokens))}
+      ${renderMetric("Latest tokens", formatTokens(latest.tokens))}
     </div>
   `;
 }
@@ -818,16 +836,14 @@ function renderClaudeCostSummary(provider: ProviderUsage): string {
   }
 
   const tokenUsage = provider.tokenUsage;
-  const latest = latestDailyUsage(provider.dailyUsage);
-  const latestCost = latest?.costUSD ?? tokenUsage.sessionCostUSD;
-  const latestTokens = latest?.totalTokens ?? tokenUsage.sessionTokens;
-  const latestLabel = latest?.dayKey === localDayKey() ? "Today" : "Latest";
+  const latest = latestUsageSummary(provider);
+  const latestLabel = latest.isToday ? "Today" : "Latest";
 
   return `
     <div class="usage-section cost-summary">
       <div>
         <h3>Cost</h3>
-        <p>${latestLabel}: ${formatCostAndTokens(latestCost, latestTokens)}</p>
+        <p>${latestLabel}: ${formatCostAndTokens(latest.cost, latest.tokens)}</p>
         <p>Last 30 days: ${formatCostAndTokens(tokenUsage.last30DaysCostUSD, tokenUsage.last30DaysTokens)}</p>
       </div>
       <span class="cost-chevron" aria-hidden="true">&rsaquo;</span>
@@ -1405,6 +1421,15 @@ async function refreshUsage(manual = false): Promise<void> {
 }
 
 async function initialize(): Promise<void> {
+  try {
+    const bounds = await invoke<ScaleBounds>("get_scale_bounds");
+    MIN_SCALE = bounds.minScale;
+    MAX_SCALE = bounds.maxScale;
+    BASE_WINDOW_SIZE = bounds.baseWindowSize;
+  } catch {
+    // Non-fatal: the compiled-in mirrors of the backend constants remain.
+  }
+
   try {
     currentSettings = normalizeSettings(await invoke<WidgetSettings>("get_widget_settings"));
   } catch {
