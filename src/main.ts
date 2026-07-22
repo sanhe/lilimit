@@ -10,6 +10,7 @@ type WidgetBackground = "dark" | "light";
 type KeychainAccess = "off" | "allow";
 type ToolbarDisplay = "text" | "bars";
 type FullTab = "overview" | "codex" | "claude";
+type ProviderName = "Codex" | "Claude";
 
 type WindowPosition = {
   x: number;
@@ -83,6 +84,22 @@ type UsageSnapshot = {
   error: string | null;
 };
 
+type ProviderAuthStatus = {
+  provider: ProviderName;
+  cliAvailable: boolean;
+  loggedIn: boolean;
+  authMethod: string | null;
+  accountEmail: string | null;
+  planText: string | null;
+  detail: string;
+};
+
+type ProviderLoginResponse = {
+  authStatuses: ProviderAuthStatus[];
+  snapshot: UsageSnapshot | null;
+  refreshError: string | null;
+};
+
 const REFRESH_MS = 5 * 60 * 1000;
 const STALE_MS = 15 * 60 * 1000;
 // Startup mirrors of the scale bounds the Rust backend clamps to and the base
@@ -129,6 +146,10 @@ let latestSnapshot: UsageSnapshot | null = null;
 let settingsError: string | null = null;
 let collectionError: string | null = null;
 let refreshInProgress = false;
+let authStatuses: ProviderAuthStatus[] = [];
+let authStatusesLoading = false;
+let loginInProgress: ProviderName | null = null;
+let accountNotice: string | null = null;
 let currentFullTab: FullTab = "overview";
 // Resize-grip drag state (see bindResizeGrip). resizeStart is non-null only
 // while a grip drag is in progress; renderCurrent() defers full re-renders for
@@ -225,18 +246,6 @@ function formatAge(updatedAt: string | null): string {
   return `${diffDays}d ago`;
 }
 
-function providerTone(percent: number): string {
-  if (percent <= 25) {
-    return "low";
-  }
-
-  if (percent <= 50) {
-    return "medium";
-  }
-
-  return "high";
-}
-
 function providerColor(name: string): string {
   switch (name.toLowerCase()) {
     case "codex":
@@ -246,10 +255,6 @@ function providerColor(name: string): string {
     default:
       return "#67d391";
   }
-}
-
-function formatPercent(value: number | null): string {
-  return value === null ? "n/a" : `${value}%`;
 }
 
 function formatUsagePercent(value: number | null): string {
@@ -482,6 +487,73 @@ function fallbackRows(provider: ProviderUsage): UsageRow[] {
   return rows;
 }
 
+function providerUsageRows(provider: ProviderUsage): UsageRow[] {
+  return provider.usageRows.length > 0 ? provider.usageRows : fallbackRows(provider);
+}
+
+function authStatusFor(provider: ProviderName): ProviderAuthStatus | null {
+  return (
+    authStatuses.find((status) => status.provider.toLowerCase() === provider.toLowerCase()) ?? null
+  );
+}
+
+function loginButtonLabel(provider: ProviderName, status: ProviderAuthStatus | null): string {
+  if (loginInProgress === provider) {
+    return "Signing in…";
+  }
+  return status?.loggedIn ? "Sign in again" : "Sign in";
+}
+
+function renderLoginButton(provider: ProviderName, compact = false): string {
+  const status = authStatusFor(provider);
+  const unavailable = status !== null && !status.cliAvailable;
+  const disabled = loginInProgress !== null || authStatusesLoading || unavailable;
+  const title = unavailable ? `${provider} CLI not found` : `Sign in to ${provider}`;
+  return `
+    <button
+      class="${compact ? "state-login-button" : "account-login-button"}"
+      type="button"
+      data-login-provider="${provider.toLowerCase()}"
+      title="${escapeHtml(title)}"
+      ${disabled ? "disabled" : ""}
+    >${escapeHtml(loginButtonLabel(provider, status))}</button>
+  `;
+}
+
+function renderAccountRow(provider: ProviderName): string {
+  const status = authStatusFor(provider);
+  const detail = status?.detail ?? (authStatusesLoading ? "Checking sign-in…" : "Status unavailable");
+  const account = [status?.accountEmail, status?.planText].filter(Boolean).join(" · ");
+  const stateClass = status?.loggedIn ? "signed-in" : "signed-out";
+
+  return `
+    <div class="account-row ${stateClass}">
+      <div class="account-copy">
+        <div class="account-heading">
+          <strong>${provider}</strong>
+          <span>${escapeHtml(detail)}</span>
+        </div>
+        ${account ? `<small>${escapeHtml(account)}</small>` : ""}
+      </div>
+      ${renderLoginButton(provider)}
+    </div>
+  `;
+}
+
+function renderAccountsSection(): string {
+  return `
+    <section class="accounts-section" aria-label="Provider accounts">
+      <div class="settings-section-title">
+        <span>Accounts</span>
+        <small>Official CLI sign-in</small>
+      </div>
+      ${renderAccountRow("Codex")}
+      ${renderAccountRow("Claude")}
+      ${accountNotice ? `<p class="account-notice">${escapeHtml(accountNotice)}</p>` : ""}
+    </section>
+  `;
+}
+
 function renderSettingsPanel(): string {
   const mode = currentSettings.displayMode;
   const background = currentSettings.background;
@@ -493,6 +565,7 @@ function renderSettingsPanel(): string {
 
   return `
     <div class="settings-panel">
+      ${renderAccountsSection()}
       <div class="setting-group">
         <span>Display</span>
         <div class="segmented">
@@ -604,39 +677,89 @@ function renderTitlebar(stale = false): string {
   `;
 }
 
-function renderSimpleProvider(provider: ProviderUsage): string {
-  const session = clampPercent(provider.sessionLeftPercent);
-  const weekly = clampPercent(provider.weeklyLeftPercent);
-  const sessionTone = session === null ? "unknown" : providerTone(session);
-  const weeklyTone = weekly === null ? "unknown" : providerTone(weekly);
-  const name = escapeHtml(provider.name);
-  const resetText = escapeHtml(provider.resetText || "reset n/a");
-  const sessionWidth = session ?? 0;
-  const weeklyWidth = weekly ?? 0;
-  const providerIsStale = provider.stale || isStale(provider.updatedAt);
-  const stateTitle = provider.error ? ` title="${escapeHtml(provider.error)}"` : "";
+const OVERVIEW_PROVIDER_NAMES = ["Codex", "Claude"] as const;
+
+function overviewResetSummary(rows: UsageRow[]): string {
+  return rows
+    .slice(0, 2)
+    .filter((row): row is UsageRow & { resetText: string } => Boolean(row.resetText))
+    .map((row) => `${row.title} ${row.resetText}`)
+    .join(" · ");
+}
+
+function renderOverviewMetricRow(providerName: string, row: UsageRow | null): string {
+  const title = escapeHtml(row?.title ?? "Usage");
+  const percent = clampPercent(row?.percentLeft ?? null);
+  const width = percent ?? 0;
+  const percentText = percent === null ? "—" : `${percent}% left`;
+
+  return `
+    <div class="overview-metric-row">
+      <span class="overview-row-title">${title}</span>
+      <div class="meter overview-meter" aria-label="${escapeHtml(providerName)} ${title} remaining">
+        <div class="meter-fill" style="width: ${width}%"></div>
+      </div>
+      <span class="overview-percent">${escapeHtml(percentText)}</span>
+    </div>
+  `;
+}
+
+function renderOverviewProvider(providerName: string, provider: ProviderUsage | null, rowLimit: number): string {
+  const rows = provider ? providerUsageRows(provider) : [];
+  const visibleRows = rows.slice(0, rowLimit);
+  const resetSummary = overviewResetSummary(rows);
+  const providerIsStale = provider ? provider.stale || isStale(provider.updatedAt) : false;
+  const stateTitle = provider?.error ? ` title="${escapeHtml(provider.error)}"` : "";
   const stateBadge = providerIsStale
     ? `<span class="provider-state"${stateTitle}>stale</span>`
     : "";
+  const summary = resetSummary
+    ? `<span class="overview-reset-summary">${escapeHtml(resetSummary)}</span>`
+    : !provider
+      ? '<span class="overview-reset-summary">No data</span>'
+      : "";
+  const color = providerColor(providerName);
 
   return `
-    <section class="provider${providerIsStale ? " stale-provider" : ""}" aria-label="${name} usage"${stateTitle}>
-      <div class="provider-line">
-        <strong>${name}</strong>
-        <span class="numbers">
-          <span>${formatPercent(session)} session</span>
-          <span>${formatPercent(weekly)} week</span>
-          <span>${resetText}</span>
-          ${stateBadge}
-        </span>
+    <section
+      class="provider overview-provider${providerIsStale ? " stale-provider" : ""}${provider ? "" : " missing-provider"}"
+      style="--overview-color: ${color}"
+      aria-label="${escapeHtml(providerName)} usage"
+      ${stateTitle}
+    >
+      <div class="overview-provider-heading">
+        <strong>${escapeHtml(providerName)}</strong>
+        <span class="overview-provider-summary">${summary}${stateBadge}</span>
       </div>
-      <div class="simple-meters">
-        <div class="meter" aria-label="${name} session left">
-          <div class="meter-fill ${sessionTone}" style="width: ${sessionWidth}%"></div>
-        </div>
-        <div class="meter week-meter" aria-label="${name} weekly left">
-          <div class="meter-fill ${weeklyTone}" style="width: ${weeklyWidth}%"></div>
-        </div>
+      <div class="overview-rows">
+        ${
+          visibleRows.length > 0
+            ? visibleRows.map((row) => renderOverviewMetricRow(providerName, row)).join("")
+            : renderOverviewMetricRow(providerName, null)
+        }
+      </div>
+    </section>
+  `;
+}
+
+function renderOverviewProviders(providers: ProviderUsage[], rowLimit: number): string {
+  return OVERVIEW_PROVIDER_NAMES.map((providerName) => {
+    const provider =
+      providers.find((candidate) => candidate.name.toLowerCase() === providerName.toLowerCase()) ??
+      null;
+    return renderOverviewProvider(providerName, provider, rowLimit);
+  }).join("");
+}
+
+function renderFullOverview(providers: ProviderUsage[], updatedAt: string | null): string {
+  return `
+    <section class="full-overview" aria-label="Codex and Claude overview">
+      <div class="full-overview-header">
+        <h2>Codex + Claude</h2>
+        <span>${updatedAt ? `Updated ${escapeHtml(formatAge(updatedAt))}` : "No data"}</span>
+      </div>
+      <div class="overview-providers full-overview-providers">
+        ${renderOverviewProviders(providers, 2)}
       </div>
     </section>
   `;
@@ -853,7 +976,7 @@ function renderClaudeCostSummary(provider: ProviderUsage): string {
 
 function renderFullProvider(provider: ProviderUsage): string {
   const color = providerColor(provider.name);
-  const rows = provider.usageRows.length > 0 ? provider.usageRows : fallbackRows(provider);
+  const rows = providerUsageRows(provider);
   const standardRows = rows.filter((row) => row.id !== "extra-usage");
   const extraUsageRows = rows.filter((row) => row.id === "extra-usage");
   const name = escapeHtml(provider.name);
@@ -1006,7 +1129,7 @@ function renderState(snapshot: UsageSnapshot): string {
     if (snapshot.status === "missing") {
       return {
         title: "No usage data yet",
-        body: snapshot.path,
+        body: "Sign in with an installed CLI to load account and usage data.",
       };
     }
 
@@ -1029,6 +1152,11 @@ function renderState(snapshot: UsageSnapshot): string {
       <div class="state-body" data-tauri-drag-region>
         <p>${escapeHtml(detail.title)}</p>
         <code>${escapeHtml(detail.body)}</code>
+        ${
+          snapshot.status === "missing"
+            ? `<div class="state-login-actions">${renderLoginButton("Codex", true)}${renderLoginButton("Claude", true)}</div>`
+            : ""
+        }
         ${collectorError}
       </div>
     </main>
@@ -1048,9 +1176,11 @@ function renderReady(snapshot: UsageSnapshot): string {
         ${renderFullTabs(providers)}
         <div class="full-content">
           ${
-            visibleProviders.length > 0
-              ? visibleProviders.map((provider) => renderFullProvider(provider)).join("")
-              : `<p class="empty">No ${escapeHtml(fullTabLabel(currentFullTab))} data</p>`
+            currentFullTab === "overview"
+              ? renderFullOverview(providers, snapshot.updatedAt)
+              : visibleProviders.length > 0
+                ? visibleProviders.map((provider) => renderFullProvider(provider)).join("")
+                : `<p class="empty">No ${escapeHtml(fullTabLabel(currentFullTab))} data</p>`
           }
         </div>
         <footer data-tauri-drag-region>
@@ -1064,12 +1194,8 @@ function renderReady(snapshot: UsageSnapshot): string {
   return `
     <main class="surface widget simple-view ${currentSettings.background}-bg" data-tauri-drag-region>
       ${renderTitlebar(stale)}
-      <div class="providers">
-        ${
-          providers.length > 0
-            ? providers.map(renderSimpleProvider).join("")
-            : '<p class="empty">No provider data</p>'
-        }
+      <div class="providers overview-providers compact-overview-providers">
+        ${renderOverviewProviders(providers, 1)}
       </div>
       <footer data-tauri-drag-region>
         <span>Updated ${formatUpdatedAt(snapshot.updatedAt)} / ${sourceLabel(snapshot.source)}</span>
@@ -1331,6 +1457,13 @@ function bindInteractions(): void {
     });
   });
 
+  appRoot.querySelectorAll<HTMLButtonElement>("[data-login-provider]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const provider: ProviderName = button.dataset.loginProvider === "claude" ? "Claude" : "Codex";
+      void signInProvider(provider);
+    });
+  });
+
   appRoot.querySelector(".settings-refresh-button")?.addEventListener("click", () => {
     void refreshCollectedFromSettings();
   });
@@ -1370,6 +1503,64 @@ function renderAfterSettingsChange(): void {
   }
 }
 
+async function loadProviderAuthStatuses(): Promise<void> {
+  if (authStatusesLoading || loginInProgress !== null) {
+    return;
+  }
+
+  authStatusesLoading = true;
+  renderAfterSettingsChange();
+  try {
+    authStatuses = await invoke<ProviderAuthStatus[]>("get_provider_auth_statuses");
+  } catch (error) {
+    if (isSettingsWindow) {
+      settingsError = error instanceof Error ? error.message : String(error);
+    }
+  } finally {
+    authStatusesLoading = false;
+    renderAfterSettingsChange();
+  }
+}
+
+async function signInProvider(provider: ProviderName): Promise<void> {
+  if (loginInProgress !== null) {
+    return;
+  }
+
+  loginInProgress = provider;
+  settingsError = null;
+  accountNotice = `Finish ${provider} sign-in in your browser.`;
+  renderAfterSettingsChange();
+
+  try {
+    const result = await invoke<ProviderLoginResponse>("login_provider", {
+      provider: provider.toLowerCase(),
+    });
+    authStatuses = result.authStatuses;
+    if (result.snapshot) {
+      latestSnapshot = result.snapshot;
+      collectionError = result.snapshot.error;
+    }
+    if (result.refreshError) {
+      const message = `${provider} signed in, but usage could not be loaded: ${result.refreshError}`;
+      settingsError = message;
+      collectionError = message;
+      accountNotice = null;
+    } else {
+      settingsError = null;
+      accountNotice = `${provider} signed in and usage refreshed.`;
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    settingsError = message;
+    collectionError = message;
+    accountNotice = null;
+  } finally {
+    loginInProgress = null;
+    renderAfterSettingsChange();
+  }
+}
+
 async function refreshCollectedFromSettings(): Promise<void> {
   try {
     const collected = await invoke<UsageSnapshot>("refresh_collected_usage_snapshot", {
@@ -1380,6 +1571,7 @@ async function refreshCollectedFromSettings(): Promise<void> {
     settingsError = error instanceof Error ? error.message : String(error);
   }
   renderSettingsWindow();
+  void loadProviderAuthStatuses();
 }
 
 async function refreshUsage(manual = false): Promise<void> {
@@ -1448,6 +1640,7 @@ async function initialize(): Promise<void> {
   if (isSettingsWindow) {
     bindSettingsWindowShortcuts();
     renderSettingsWindow();
+    void loadProviderAuthStatuses();
     return;
   }
 
@@ -1469,6 +1662,7 @@ async function initialize(): Promise<void> {
   }
 
   renderLoading();
+  void loadProviderAuthStatuses();
 
   // Re-assert the saved scale now that the webview has loaded. The backend also
   // applies it at startup, but on some WebKitGTK builds a zoom set before the

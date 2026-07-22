@@ -17,6 +17,8 @@ Codex credentials are read from `~/.codex/auth.json` (honoring `CODEX_HOME`). Wh
 
 Claude credentials are read from `~/.claude/.credentials.json`, or from the `LILIMIT_CLAUDE_OAUTH_TOKEN` environment variable if set. lilimit never refreshes or rewrites Claude credentials; when they expire, run `claude` to refresh them.
 
+The Accounts section in settings can start the official browser login flows for both providers. lilimit runs `codex login` for ChatGPT/Codex and `claude auth login --claudeai` for a Claude subscription, then immediately fetches account and usage information from the providers' usage APIs. Login URLs, codes, and tokens are never returned to the webview or written to lilimit logs.
+
 ## Data file
 
 lilimit collected snapshot on macOS:
@@ -49,13 +51,14 @@ Ubuntu Linux:
 
 The in-widget settings button lets you choose:
 
+- Accounts: inspect Codex and Claude sign-in state, sign in, or re-authenticate through the installed official CLI
 - Display mode: `Simple` or `Full`
 - Background: `Dark` or `Light`
 - Keychain: `Off` or `Allow`
 - Toolbar: `Bars` or `Text`
 - Scale: `80%` to `200%` (stepper in 10% steps, or drag the widget's corner grip)
 
-`Simple` keeps the small 280x140 monitor view. `Full` expands the widget to show detailed lilimit provider data, including usage rows, reset text, token/cost totals, credits when present, and recent daily usage bars. The last reported window position is saved automatically and restored on the next launch.
+`Simple` keeps the small 280x140 Codex + Claude overview, showing each provider's first available usage row and an explicit placeholder when one has no data. `Full` adds a CodexBar-style overview with the first two provider-specific rows, plus separate Codex and Claude tabs for reset text, token/cost totals, credits when present, and recent daily usage bars. The last reported window position is saved automatically and restored on the next launch.
 
 `Scale` grows or shrinks the whole widget — window, fonts, meters, and charts together — which is handy when the default size is too small on high-resolution Ubuntu displays. It resizes the window and applies a matching webview zoom, so the layout stays sharp. You can step the scale from settings, or drag the resize grip in the widget's bottom-right corner to size it directly — the window and its contents grow together. The effective scale is capped to the monitor work area so the widget never grows past the visible screen, and the settings window itself stays at native size. Webview zoom needs macOS 11+ (Linux is fine); on older macOS the window only resizes.
 
@@ -130,11 +133,11 @@ sudo gtk-update-icon-cache -f /usr/share/icons/hicolor
 sudo update-desktop-database
 ```
 
-Before launching lilimit, sign in with the CLIs you want it to read:
+You can sign in from lilimit settings. The equivalent terminal commands are:
 
 ```sh
-codex
-claude
+codex login
+claude auth login --claudeai
 ```
 
 Lilimit reads Codex credentials from `~/.codex/auth.json` and Claude credentials from `~/.claude/.credentials.json`. Its own Ubuntu data lives in `~/.config/lilimit`.
@@ -195,7 +198,7 @@ make tauri-build
 - Press `Cmd+Shift+L` on macOS or `Ctrl+Shift+L` on Linux to show or hide the widget.
 - lilimit refreshes `collected_snapshot.json` at most every 5 minutes from local CLI OAuth credentials.
 - Codex usage is read from the OAuth tokens in `~/.codex/auth.json` and fetched from the ChatGPT usage endpoint. API-key-only Codex auth cannot read these usage stats.
-- Claude usage is read from `~/.claude/.credentials.json` and fetched from Anthropic's OAuth usage endpoint. On macOS, optional Keychain access can read Claude Code's credential item when explicitly enabled. Claude Code owns these credentials, so lilimit does not refresh expired Claude OAuth tokens directly; run `claude` to refresh or re-authenticate them. Claude refreshes are rate-limited to 5 minutes, and Anthropic `429` responses use exponential backoff while keeping the last successful Claude data visible as stale.
+- Claude usage is read from `~/.claude/.credentials.json` and fetched from Anthropic's OAuth usage endpoint. On macOS, optional Keychain access can read Claude Code's credential item when explicitly enabled. Claude Code owns these credentials, so lilimit does not refresh expired Claude OAuth tokens directly; use the settings sign-in action or run `claude auth login --claudeai` to re-authenticate. Claude refreshes are rate-limited to 5 minutes, and Anthropic `429` responses use exponential backoff while keeping the last successful Claude data visible as stale.
 - Browser cookie import and Chrome Keychain cookie decryption are intentionally not implemented; lilimit uses local CLI OAuth credentials instead.
 - Display preferences and the last reported window position are stored in lilimit's local `settings.json`.
 - Always-on-top behavior is compositor-dependent on Ubuntu. GNOME on X11 usually honors it more consistently than GNOME on Wayland.

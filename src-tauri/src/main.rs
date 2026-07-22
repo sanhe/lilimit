@@ -1,20 +1,15 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     env, fs,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex, OnceLock,
     },
     thread,
-    time::{Duration, SystemTime},
-};
-#[cfg(target_os = "macos")]
-use std::{
-    io::Read,
-    process::{Command, Stdio},
-    time::Instant,
+    time::{Duration, Instant, SystemTime},
 };
 
 use chrono::{DateTime, Days, Local, NaiveDate, SecondsFormat, Utc};
@@ -54,6 +49,9 @@ const WINDOW_POSITION_FLUSH_DELAY: Duration = Duration::from_millis(500);
 const CLAUDE_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const CLAUDE_RATE_LIMIT_BASE_BACKOFF: Duration = Duration::from_secs(5 * 60);
 const CLAUDE_RATE_LIMIT_MAX_BACKOFF: Duration = Duration::from_secs(6 * 60 * 60);
+const CLAUDE_WEEK_MINUTES: f64 = 7.0 * 24.0 * 60.0;
+const CLI_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+const CLI_LOGIN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const CODEX_AUTH_REFRESH_AFTER_DAYS: i64 = 8;
 const CODEX_REFRESH_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
 const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -282,6 +280,68 @@ struct UsageSnapshotResponse {
     error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum LoginProvider {
+    Codex,
+    Claude,
+}
+
+impl LoginProvider {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Codex => "Codex",
+            Self::Claude => "Claude",
+        }
+    }
+
+    fn executable(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+        }
+    }
+
+    fn status_args(self) -> &'static [&'static str] {
+        match self {
+            Self::Codex => &["login", "status"],
+            Self::Claude => &["auth", "status"],
+        }
+    }
+
+    fn login_args(self) -> &'static [&'static str] {
+        match self {
+            Self::Codex => &["login"],
+            Self::Claude => &["auth", "login", "--claudeai"],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderAuthStatus {
+    provider: String,
+    cli_available: bool,
+    logged_in: bool,
+    auth_method: Option<String>,
+    account_email: Option<String>,
+    plan_text: Option<String>,
+    detail: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderLoginResponse {
+    auth_statuses: Vec<ProviderAuthStatus>,
+    snapshot: Option<UsageSnapshotResponse>,
+    refresh_error: Option<String>,
+}
+
+struct CliCommandOutput {
+    success: bool,
+    stdout: String,
+}
+
 fn usage_snapshot_candidate() -> Result<SnapshotCandidate, String> {
     Ok(SnapshotCandidate {
         path: collected_usage_snapshot_path()?,
@@ -419,6 +479,243 @@ fn read_collected_usage_snapshot_file() -> Result<Option<UsageSnapshotFile>, Str
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.to_string()),
     }
+}
+
+fn resolve_cli_binary(provider: LoginProvider) -> Option<PathBuf> {
+    let executable = provider.executable();
+    let mut candidates = env::var_os("PATH")
+        .map(|path| {
+            env::split_paths(&path)
+                .map(|directory| directory.join(executable))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    candidates.extend([
+        PathBuf::from("/opt/homebrew/bin").join(executable),
+        PathBuf::from("/usr/local/bin").join(executable),
+        PathBuf::from("/usr/bin").join(executable),
+    ]);
+    if let Ok(home) = home_dir() {
+        candidates.extend([
+            home.join(".local").join("bin").join(executable),
+            home.join(".claude").join("local").join(executable),
+            home.join(".npm-global").join("bin").join(executable),
+        ]);
+    }
+
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+fn run_cli_command(
+    binary: &Path,
+    args: &[&str],
+    timeout: Duration,
+    capture_stdout: bool,
+    send_enter: bool,
+) -> Result<CliCommandOutput, String> {
+    let mut command = Command::new(binary);
+    command.args(args);
+    run_configured_cli_command(command, timeout, capture_stdout, send_enter)
+}
+
+fn run_cli_login(binary: &Path, provider: LoginProvider) -> Result<CliCommandOutput, String> {
+    #[cfg(target_os = "macos")]
+    let mut command = if provider == LoginProvider::Claude {
+        // Claude's interactive login expects a terminal. CodexBar runs this
+        // flow through a PTY too; macOS `script` provides one without adding a
+        // bundled OAuth implementation or exposing the browser URL to the UI.
+        let mut command = Command::new("/usr/bin/script");
+        command.args(["-q", "/dev/null"]).arg(binary);
+        command
+    } else {
+        Command::new(binary)
+    };
+    #[cfg(not(target_os = "macos"))]
+    let mut command = Command::new(binary);
+
+    command.args(provider.login_args());
+    run_configured_cli_command(
+        command,
+        CLI_LOGIN_TIMEOUT,
+        false,
+        provider == LoginProvider::Claude,
+    )
+}
+
+fn run_configured_cli_command(
+    mut command: Command,
+    timeout: Duration,
+    capture_stdout: bool,
+    send_enter: bool,
+) -> Result<CliCommandOutput, String> {
+    command
+        .stdin(if send_enter {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(if capture_stdout {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        // Login output can contain a short-lived URL or code. It belongs in
+        // the official CLI/browser flow and must never enter lilimit logs.
+        .stderr(Stdio::null());
+
+    let mut child = command.spawn().map_err(|error| error.to_string())?;
+    let mut stdin = child.stdin.take();
+    if send_enter {
+        // Claude Code versions that ask for confirmation before opening the
+        // browser accept Enter here. Keeping the pipe alive also avoids an
+        // immediate EOF while the browser callback is pending.
+        if let Some(stdin) = stdin.as_mut() {
+            let _ = stdin.write_all(b"\n");
+            let _ = stdin.flush();
+        }
+    }
+    let mut stdout = child.stdout.take();
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+            let mut output = String::new();
+            if let Some(mut stdout) = stdout.take() {
+                stdout
+                    .read_to_string(&mut output)
+                    .map_err(|error| error.to_string())?;
+            }
+            return Ok(CliCommandOutput {
+                success: status.success(),
+                stdout: output,
+            });
+        }
+
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("command timed out".to_string());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn local_provider_credentials_present(provider: LoginProvider) -> bool {
+    match provider {
+        LoginProvider::Codex => load_codex_credentials().is_ok(),
+        // Do not trigger a Keychain prompt just by opening settings. The
+        // official Claude status command reads its own credential store; this
+        // fallback covers file- and environment-based credentials.
+        LoginProvider::Claude => load_claude_credentials(KeychainAccess::Off)
+            .map(|credentials| !claude_credentials_are_expired(&credentials))
+            .unwrap_or(false),
+    }
+}
+
+fn parse_provider_cli_status(
+    provider: LoginProvider,
+    output: &CliCommandOutput,
+) -> (bool, Option<String>) {
+    match provider {
+        LoginProvider::Codex => {
+            let lower = output.stdout.to_lowercase();
+            let logged_in = lower.contains("logged in") && !lower.contains("not logged in");
+            let method = if logged_in && lower.contains("chatgpt") {
+                Some("ChatGPT".to_string())
+            } else if logged_in && lower.contains("api key") {
+                Some("API key".to_string())
+            } else {
+                None
+            };
+            (logged_in, method)
+        }
+        LoginProvider::Claude => {
+            let value = serde_json::from_str::<Value>(&output.stdout).unwrap_or(Value::Null);
+            let logged_in = value
+                .get("loggedIn")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let method = string_at(&value, &["authMethod"])
+                .filter(|method| !method.eq_ignore_ascii_case("none"));
+            (logged_in, method)
+        }
+    }
+}
+
+fn provider_auth_status(
+    provider: LoginProvider,
+    snapshot: Option<&UsageSnapshotFile>,
+) -> ProviderAuthStatus {
+    let binary = resolve_cli_binary(provider);
+    let cli_status = binary.as_ref().and_then(|binary| {
+        run_cli_command(
+            binary,
+            provider.status_args(),
+            CLI_STATUS_TIMEOUT,
+            true,
+            false,
+        )
+        .ok()
+    });
+    let (mut logged_in, auth_method) = cli_status
+        .as_ref()
+        .map(|output| parse_provider_cli_status(provider, output))
+        .unwrap_or((false, None));
+    if !logged_in {
+        logged_in = local_provider_credentials_present(provider);
+    }
+
+    let provider_usage = snapshot
+        .and_then(|snapshot| snapshot_provider(snapshot, provider.label()))
+        .filter(|_| logged_in);
+    let usage_needs_reauthentication = provider_usage
+        .and_then(|usage| usage.error.as_deref())
+        .is_some_and(|error| {
+            let lower = error.to_lowercase();
+            lower.contains("credentials are expired")
+                || lower.contains("credentials were rejected")
+                || lower.contains("re-authenticate")
+                || lower.contains("unauthorized")
+        });
+    let detail = if usage_needs_reauthentication {
+        "Usage needs re-authentication".to_string()
+    } else if logged_in {
+        match auth_method.as_deref() {
+            Some(method) => format!("Signed in with {method}"),
+            None if binary.is_none() => "Credential found; CLI unavailable".to_string(),
+            None => "Signed in".to_string(),
+        }
+    } else if binary.is_some() {
+        "Not signed in".to_string()
+    } else {
+        format!("{} CLI not found", provider.label())
+    };
+
+    ProviderAuthStatus {
+        provider: provider.label().to_string(),
+        cli_available: binary.is_some(),
+        logged_in,
+        auth_method,
+        account_email: provider_usage.and_then(|usage| usage.account_email.clone()),
+        plan_text: provider_usage.and_then(|usage| usage.plan_text.clone()),
+        detail,
+    }
+}
+
+fn provider_auth_statuses(snapshot: Option<&UsageSnapshotFile>) -> Vec<ProviderAuthStatus> {
+    [LoginProvider::Codex, LoginProvider::Claude]
+        .into_iter()
+        .map(|provider| provider_auth_status(provider, snapshot))
+        .collect()
+}
+
+#[tauri::command]
+async fn get_provider_auth_statuses() -> Result<Vec<ProviderAuthStatus>, String> {
+    let snapshot = read_collected_usage_snapshot_file().unwrap_or(None);
+    tauri::async_runtime::spawn_blocking(move || provider_auth_statuses(snapshot.as_ref()))
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -847,7 +1144,59 @@ fn normalize_lilimit_provider(mut provider: ProviderUsage) -> ProviderUsage {
         }
     }
 
+    apply_codex_weekly_cap(&mut provider);
+
     provider
+}
+
+// CodexBar treats the weekly window as a hard cap on the shorter session
+// window. A positive session balance is not usable while an exhausted weekly
+// window is still active, so normalize it to zero for every consumer (widget,
+// full details, and tray) instead of correcting only one presentation layer.
+fn apply_codex_weekly_cap(provider: &mut ProviderUsage) {
+    if !provider.name.eq_ignore_ascii_case("codex") {
+        return;
+    }
+
+    let weekly_is_exhausted = provider
+        .usage_rows
+        .iter()
+        .find(|row| row.id == "weekly" || row.id == "secondary")
+        .and_then(|row| row.percent_left)
+        .is_some_and(|percent| clamp_percent(percent) <= 0.0);
+    if !weekly_is_exhausted {
+        return;
+    }
+
+    let weekly_reset = provider
+        .secondary
+        .as_ref()
+        .and_then(|window| window.resets_at.as_deref())
+        .and_then(parse_rfc3339_datetime);
+    let weekly_reset_is_active = match weekly_reset {
+        Some(reset) => reset > Utc::now(),
+        None => true,
+    };
+    if !weekly_reset_is_active {
+        return;
+    }
+
+    if provider.session_left_percent.is_some() {
+        provider.session_left_percent = Some(0.0);
+    }
+    if let Some(primary) = provider.primary.as_mut() {
+        if primary.percent_left.is_some() {
+            primary.percent_left = Some(0.0);
+        }
+        if primary.used_percent.is_some() {
+            primary.used_percent = Some(100.0);
+        }
+    }
+    for row in &mut provider.usage_rows {
+        if (row.id == "session" || row.id == "primary") && row.percent_left.is_some() {
+            row.percent_left = Some(0.0);
+        }
+    }
 }
 
 fn clamp_percent(value: f64) -> f64 {
@@ -1018,20 +1367,6 @@ struct ClaudeOAuthUsageResponse {
     #[serde(default)]
     seven_day_sonnet: Option<ClaudeOAuthWindow>,
     #[serde(default)]
-    seven_day_design: OptionalClaudeOAuthWindow,
-    #[serde(default)]
-    seven_day_claude_design: OptionalClaudeOAuthWindow,
-    #[serde(default)]
-    claude_design: OptionalClaudeOAuthWindow,
-    #[serde(default)]
-    design: OptionalClaudeOAuthWindow,
-    #[serde(default)]
-    seven_day_omelette: OptionalClaudeOAuthWindow,
-    #[serde(default)]
-    omelette: OptionalClaudeOAuthWindow,
-    #[serde(default)]
-    omelette_promotional: OptionalClaudeOAuthWindow,
-    #[serde(default)]
     seven_day_routines: OptionalClaudeOAuthWindow,
     #[serde(default)]
     seven_day_claude_routines: OptionalClaudeOAuthWindow,
@@ -1046,26 +1381,14 @@ struct ClaudeOAuthUsageResponse {
     #[serde(default)]
     cowork: OptionalClaudeOAuthWindow,
     #[serde(default)]
+    limits: Vec<ClaudeOAuthLimit>,
+    #[serde(default)]
     extra_usage: Option<ClaudeExtraUsage>,
 }
 
 impl ClaudeOAuthUsageResponse {
-    fn design_window(&self) -> Option<&OptionalClaudeOAuthWindow> {
-        [
-            &self.seven_day_design,
-            &self.seven_day_claude_design,
-            &self.claude_design,
-            &self.design,
-            &self.seven_day_omelette,
-            &self.omelette,
-            &self.omelette_promotional,
-        ]
-        .into_iter()
-        .find(|window| window.present)
-    }
-
     fn routines_window(&self) -> Option<&OptionalClaudeOAuthWindow> {
-        [
+        let aliases = [
             &self.seven_day_routines,
             &self.seven_day_claude_routines,
             &self.claude_routines,
@@ -1073,10 +1396,44 @@ impl ClaudeOAuthUsageResponse {
             &self.routine,
             &self.seven_day_cowork,
             &self.cowork,
-        ]
-        .into_iter()
-        .find(|window| window.present)
+        ];
+        // Prefer a populated alias over an earlier null one. If every known
+        // alias is null, retain the first present key so the UI can show the
+        // product lane at 100% remaining, matching CodexBar.
+        aliases
+            .iter()
+            .copied()
+            .find(|window| window.value.is_some())
+            .or_else(|| aliases.into_iter().find(|window| window.present))
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeOAuthLimit {
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    group: Option<String>,
+    #[serde(default, deserialize_with = "optional_f64_from_json")]
+    percent: Option<f64>,
+    #[serde(default)]
+    resets_at: Option<String>,
+    #[serde(default)]
+    scope: Option<ClaudeOAuthLimitScope>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeOAuthLimitScope {
+    #[serde(default)]
+    model: Option<ClaudeOAuthLimitModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeOAuthLimitModel {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    display_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1105,6 +1462,14 @@ struct ClaudeExtraUsage {
 async fn refresh_collected_usage_snapshot(
     app: AppHandle,
     force: Option<bool>,
+) -> Result<UsageSnapshotResponse, String> {
+    collect_usage_snapshot(app, force, false).await
+}
+
+async fn collect_usage_snapshot(
+    app: AppHandle,
+    force: Option<bool>,
+    bypass_claude_throttle: bool,
 ) -> Result<UsageSnapshotResponse, String> {
     let force = force.unwrap_or(false);
     let settings = read_widget_settings().unwrap_or_default();
@@ -1144,6 +1509,7 @@ async fn refresh_collected_usage_snapshot(
         settings.keychain_access,
         previous_claude,
         &mut collector_state,
+        bypass_claude_throttle,
     )
     .await;
     write_collector_state(&collector_state)?;
@@ -1201,6 +1567,76 @@ async fn refresh_collected_usage_snapshot(
     // stale data until its next poll tick.
     let _ = app.emit_to("main", "usage-changed", &response);
     Ok(response)
+}
+
+#[tauri::command]
+async fn login_provider(
+    app: AppHandle,
+    provider: LoginProvider,
+) -> Result<ProviderLoginResponse, String> {
+    let binary = resolve_cli_binary(provider).ok_or_else(|| {
+        format!(
+            "{} CLI was not found. Install it before signing in.",
+            provider.label()
+        )
+    })?;
+    let login_result =
+        tauri::async_runtime::spawn_blocking(move || run_cli_login(&binary, provider))
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| {
+                if error == "command timed out" {
+                    format!("{} sign-in timed out.", provider.label())
+                } else {
+                    format!("Could not start {} sign-in: {error}", provider.label())
+                }
+            })?;
+    if !login_result.success {
+        return Err(format!(
+            "{} sign-in was cancelled or did not complete.",
+            provider.label()
+        ));
+    }
+
+    let verified =
+        tauri::async_runtime::spawn_blocking(move || provider_auth_status(provider, None))
+            .await
+            .map_err(|error| error.to_string())?;
+    if !verified.logged_in {
+        return Err(format!(
+            "{} did not report an active sign-in.",
+            provider.label()
+        ));
+    }
+
+    // A manual settings refresh keeps Claude's five-minute guard intact. A
+    // completed login is the one case where fetching immediately is required:
+    // bypass the old credential's cache/backoff and load the new account now.
+    let refresh_result =
+        collect_usage_snapshot(app, Some(true), provider == LoginProvider::Claude).await;
+    let (snapshot, refresh_error) = match refresh_result {
+        Ok(snapshot) => {
+            let selected_error = snapshot
+                .providers
+                .iter()
+                .find(|usage| usage.name.eq_ignore_ascii_case(provider.label()))
+                .and_then(|usage| usage.error.clone());
+            (Some(snapshot), selected_error)
+        }
+        Err(error) => (None, Some(error)),
+    };
+    let stored_snapshot = read_collected_usage_snapshot_file().unwrap_or(None);
+    let auth_statuses = tauri::async_runtime::spawn_blocking(move || {
+        provider_auth_statuses(stored_snapshot.as_ref())
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+
+    Ok(ProviderLoginResponse {
+        auth_statuses,
+        snapshot,
+        refresh_error,
+    })
 }
 
 fn collected_usage_snapshot_path() -> Result<PathBuf, String> {
@@ -1302,29 +1738,32 @@ async fn collect_claude_provider(
     keychain_access: KeychainAccess,
     previous: Option<ProviderUsage>,
     collector_state: &mut CollectorState,
+    bypass_throttle: bool,
 ) -> ProviderCollectionResult {
-    if let Some(provider) = previous.as_ref() {
-        if provider
-            .updated_at
-            .as_deref()
-            .is_some_and(|updated_at| timestamp_is_within(updated_at, CLAUDE_REFRESH_INTERVAL))
-        {
-            return ProviderCollectionResult::Provider(provider.clone());
+    if !bypass_throttle {
+        if let Some(provider) = previous.as_ref() {
+            if provider
+                .updated_at
+                .as_deref()
+                .is_some_and(|updated_at| timestamp_is_within(updated_at, CLAUDE_REFRESH_INTERVAL))
+            {
+                return ProviderCollectionResult::Provider(provider.clone());
+            }
         }
-    }
 
-    if let Some(next_attempt_at) = claude_backoff_until(collector_state) {
-        let warning = format!(
-            "rate limited; retry {}",
-            reset_countdown_description(next_attempt_at)
-        );
-        if let Some(provider) = previous {
-            return ProviderCollectionResult::Cached {
-                provider: stale_provider(provider, warning.clone()),
-                warning,
+        if let Some(next_attempt_at) = claude_backoff_until(collector_state) {
+            let warning = format!(
+                "rate limited; retry {}",
+                reset_countdown_description(next_attempt_at)
+            );
+            if let Some(provider) = previous {
+                return ProviderCollectionResult::Cached {
+                    provider: stale_provider(provider, warning.clone()),
+                    warning,
+                };
             };
+            return ProviderCollectionResult::Unavailable(warning);
         }
-        return ProviderCollectionResult::Unavailable(warning);
     }
 
     match fetch_claude_provider(client, keychain_access).await {
@@ -3279,7 +3718,6 @@ fn claude_provider_from_usage_with_local_usage(
     plan_text: Option<String>,
     local_usage: Option<(Option<TokenUsageSummary>, Vec<DailyUsagePoint>)>,
 ) -> ProviderUsage {
-    const WEEK_MINUTES: f64 = 7.0 * 24.0 * 60.0;
     let (token_usage, daily_usage) = local_usage.unwrap_or((None, Vec::new()));
     let five_hour = response
         .five_hour
@@ -3288,21 +3726,21 @@ fn claude_provider_from_usage_with_local_usage(
     let seven_day = response
         .seven_day
         .as_ref()
-        .and_then(|window| rate_window_from_claude(window, Some(WEEK_MINUTES)));
+        .and_then(|window| rate_window_from_claude(window, Some(CLAUDE_WEEK_MINUTES)));
     let oauth_apps = response
         .seven_day_oauth_apps
         .as_ref()
-        .and_then(|window| rate_window_from_claude(window, Some(WEEK_MINUTES)));
+        .and_then(|window| rate_window_from_claude(window, Some(CLAUDE_WEEK_MINUTES)));
     let model_weekly = response
         .seven_day_sonnet
         .as_ref()
-        .and_then(|window| rate_window_from_claude(window, Some(WEEK_MINUTES)))
+        .and_then(|window| rate_window_from_claude(window, Some(CLAUDE_WEEK_MINUTES)))
         .map(|window| ("Sonnet", window))
         .or_else(|| {
             response
                 .seven_day_opus
                 .as_ref()
-                .and_then(|window| rate_window_from_claude(window, Some(WEEK_MINUTES)))
+                .and_then(|window| rate_window_from_claude(window, Some(CLAUDE_WEEK_MINUTES)))
                 .map(|window| ("Opus", window))
         });
 
@@ -3331,14 +3769,8 @@ fn claude_provider_from_usage_with_local_usage(
         usage_rows.push(usage_row_from_window("tertiary", title, window));
     }
     if let Some(window) = response
-        .design_window()
-        .and_then(|window| rate_window_from_optional_claude(window, Some(WEEK_MINUTES)))
-    {
-        usage_rows.push(usage_row_from_window("claude-design", "Designs", &window));
-    }
-    if let Some(window) = response
         .routines_window()
-        .and_then(|window| rate_window_from_optional_claude(window, Some(WEEK_MINUTES)))
+        .and_then(|window| rate_window_from_optional_claude(window, Some(CLAUDE_WEEK_MINUTES)))
     {
         usage_rows.push(usage_row_from_window(
             "claude-routines",
@@ -3346,6 +3778,7 @@ fn claude_provider_from_usage_with_local_usage(
             &window,
         ));
     }
+    usage_rows.extend(claude_scoped_weekly_usage_rows(&response.limits));
     if let Some(window) = response.extra_usage.as_ref().and_then(extra_usage_window) {
         usage_rows.push(usage_row_from_window("extra-usage", "Extra usage", &window));
     }
@@ -3374,6 +3807,76 @@ fn claude_provider_from_usage_with_local_usage(
         stale: false,
         error: None,
     }
+}
+
+fn claude_scoped_weekly_usage_rows(limits: &[ClaudeOAuthLimit]) -> Vec<UsageRow> {
+    let mut seen_ids = HashSet::new();
+    limits
+        .iter()
+        .filter_map(|limit| {
+            if limit.kind.as_deref() != Some("weekly_scoped")
+                || limit.group.as_deref() != Some("weekly")
+            {
+                return None;
+            }
+            let percent = limit.percent.filter(|value| value.is_finite())?;
+            let model = limit.scope.as_ref()?.model.as_ref()?;
+            let model_name = non_empty_trimmed(model.display_name.as_deref())?;
+            let model_name_slug = claude_limit_slug(model_name);
+            let model_id = non_empty_trimmed(model.id.as_deref());
+            let model_id_slug = model_id.map(claude_limit_slug);
+            if model_name_slug == "all-models"
+                || model_id_slug
+                    .as_deref()
+                    .is_some_and(|slug| slug == "all-models" || slug.ends_with("-all-models"))
+            {
+                return None;
+            }
+
+            let identity = model_id.unwrap_or(model_name);
+            let slug = claude_limit_slug(identity);
+            if slug.is_empty() {
+                return None;
+            }
+            let id = format!("claude-weekly-scoped-{slug}");
+            if !seen_ids.insert(id.clone()) {
+                return None;
+            }
+
+            let window = rate_window_detail_from_parts(
+                percent,
+                Some(CLAUDE_WEEK_MINUTES),
+                limit.resets_at.as_deref().and_then(parse_rfc3339_datetime),
+            );
+            Some(usage_row_from_window(
+                &id,
+                &format!("{model_name} only"),
+                &window,
+            ))
+        })
+        .collect()
+}
+
+fn non_empty_trimmed(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn claude_limit_slug(value: &str) -> String {
+    let mut slug = String::new();
+    let mut last_was_dash = false;
+    for character in value.trim().to_lowercase().chars() {
+        if character.is_alphanumeric() {
+            slug.push(character);
+            last_was_dash = false;
+        } else if !last_was_dash && !slug.is_empty() {
+            slug.push('-');
+            last_was_dash = true;
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    slug
 }
 
 fn rate_window_from_claude(
@@ -4057,6 +4560,8 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             refresh_collected_usage_snapshot,
+            login_provider,
+            get_provider_auth_statuses,
             get_usage_snapshot,
             get_widget_settings,
             save_widget_settings,
@@ -4074,6 +4579,57 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uses_official_subscription_login_commands() {
+        assert_eq!(LoginProvider::Codex.login_args(), &["login"]);
+        assert_eq!(
+            LoginProvider::Claude.login_args(),
+            &["auth", "login", "--claudeai"]
+        );
+    }
+
+    #[test]
+    fn parses_codex_cli_login_status_without_exposing_output() {
+        let signed_in = CliCommandOutput {
+            success: true,
+            stdout: "Logged in using ChatGPT\n".to_string(),
+        };
+        assert_eq!(
+            parse_provider_cli_status(LoginProvider::Codex, &signed_in),
+            (true, Some("ChatGPT".to_string()))
+        );
+
+        let signed_out = CliCommandOutput {
+            success: false,
+            stdout: "Not logged in\n".to_string(),
+        };
+        assert_eq!(
+            parse_provider_cli_status(LoginProvider::Codex, &signed_out),
+            (false, None)
+        );
+    }
+
+    #[test]
+    fn parses_claude_cli_login_status_json() {
+        let signed_in = CliCommandOutput {
+            success: true,
+            stdout: r#"{"loggedIn":true,"authMethod":"claude.ai"}"#.to_string(),
+        };
+        assert_eq!(
+            parse_provider_cli_status(LoginProvider::Claude, &signed_in),
+            (true, Some("claude.ai".to_string()))
+        );
+
+        let signed_out = CliCommandOutput {
+            success: false,
+            stdout: r#"{"loggedIn":false,"authMethod":"none"}"#.to_string(),
+        };
+        assert_eq!(
+            parse_provider_cli_status(LoginProvider::Claude, &signed_out),
+            (false, None)
+        );
+    }
 
     #[test]
     fn maps_codex_oauth_usage_to_lilimit_provider() {
@@ -4108,13 +4664,70 @@ mod tests {
     }
 
     #[test]
+    fn exhausted_codex_weekly_window_caps_session_until_reset() {
+        let json = r#"{
+          "rate_limit": {
+            "primary_window": {
+              "used_percent": 25,
+              "reset_at": 4102444800,
+              "limit_window_seconds": 18000
+            },
+            "secondary_window": {
+              "used_percent": 100,
+              "reset_at": 4103049600,
+              "limit_window_seconds": 604800
+            }
+          }
+        }"#;
+        let response: CodexUsageApiResponse = serde_json::from_str(json).unwrap();
+        let provider = codex_provider_from_usage_with_local_usage(response, None);
+
+        let capped = normalize_lilimit_provider(provider.clone());
+        assert_eq!(capped.session_left_percent, Some(0.0));
+        assert_eq!(
+            capped
+                .primary
+                .as_ref()
+                .and_then(|window| window.percent_left),
+            Some(0.0)
+        );
+        assert_eq!(
+            capped
+                .primary
+                .as_ref()
+                .and_then(|window| window.used_percent),
+            Some(100.0)
+        );
+        assert_eq!(
+            capped
+                .usage_rows
+                .iter()
+                .find(|row| row.id == "session")
+                .and_then(|row| row.percent_left),
+            Some(0.0)
+        );
+
+        let mut expired = provider;
+        expired.secondary.as_mut().unwrap().resets_at = Some("1970-01-01T00:00:01Z".to_string());
+        let expired = normalize_lilimit_provider(expired);
+        assert_eq!(expired.session_left_percent, Some(75.0));
+    }
+
+    #[test]
     fn maps_claude_oauth_usage_to_lilimit_provider() {
         let json = r#"{
           "five_hour": { "utilization": 58, "resets_at": "2100-01-01T00:00:00Z" },
           "seven_day": { "utilization": 20, "resets_at": "2100-01-08T00:00:00Z" },
           "seven_day_sonnet": { "utilization": 27, "resets_at": "2100-01-08T00:00:00Z" },
-          "seven_day_omelette": { "utilization": 0, "resets_at": "2100-01-08T00:00:00Z" },
-          "omelette_promotional": null,
+          "seven_day_routines": { "utilization": 0, "resets_at": "2100-01-08T00:00:00Z" },
+          "limits": [{
+            "kind": "weekly_scoped",
+            "group": "weekly",
+            "percent": 14,
+            "resets_at": "2100-01-08T00:00:00Z",
+            "scope": { "model": { "id": null, "display_name": "Fable" } },
+            "is_active": false
+          }],
           "extra_usage": {
             "is_enabled": true,
             "monthly_limit": 1700,
@@ -4129,15 +4742,21 @@ mod tests {
         assert_eq!(provider.name, "Claude");
         assert_eq!(provider.session_left_percent, Some(42.0));
         assert_eq!(provider.weekly_left_percent, Some(80.0));
-        assert_eq!(provider.usage_rows.len(), 5);
+        assert_eq!(provider.usage_rows.len(), 6);
         assert!(provider
             .usage_rows
             .iter()
             .any(|row| row.id == "tertiary" && row.title == "Sonnet"));
-        assert!(provider
-            .usage_rows
-            .iter()
-            .any(|row| row.id == "claude-design" && row.percent_left == Some(100.0)));
+        assert!(provider.usage_rows.iter().any(|row| {
+            row.id == "claude-weekly-scoped-fable"
+                && row.title == "Fable only"
+                && row.percent_left == Some(86.0)
+        }));
+        assert!(provider.usage_rows.iter().any(|row| {
+            row.id == "claude-routines"
+                && row.title == "Daily Routines"
+                && row.percent_left == Some(100.0)
+        }));
         assert!(provider.usage_rows.iter().any(|row| {
             row.id == "extra-usage"
                 && row.percent_left == Some(96.0)
@@ -4165,7 +4784,7 @@ mod tests {
     }
 
     #[test]
-    fn maps_null_claude_extra_windows_to_available_rows() {
+    fn ignores_legacy_design_window_and_keeps_null_routines_lane() {
         let json = r#"{
           "five_hour": { "utilization": 9, "resets_at": "2100-01-01T00:00:00Z" },
           "seven_day_omelette": null,
@@ -4174,14 +4793,68 @@ mod tests {
         let response: ClaudeOAuthUsageResponse = serde_json::from_str(json).unwrap();
         let provider = claude_provider_from_usage(response);
 
-        assert!(provider.usage_rows.iter().any(|row| {
-            row.id == "claude-design" && row.title == "Designs" && row.percent_left == Some(100.0)
-        }));
+        assert!(!provider
+            .usage_rows
+            .iter()
+            .any(|row| row.id == "claude-design"));
         assert!(provider.usage_rows.iter().any(|row| {
             row.id == "claude-routines"
                 && row.title == "Daily Routines"
                 && row.percent_left == Some(100.0)
         }));
+    }
+
+    #[test]
+    fn prefers_populated_routines_alias_over_earlier_null_alias() {
+        let json = r#"{
+          "five_hour": { "utilization": 9, "resets_at": "2100-01-01T00:00:00Z" },
+          "seven_day_routines": null,
+          "seven_day_cowork": { "utilization": 14, "resets_at": "2100-01-08T00:00:00Z" }
+        }"#;
+        let response: ClaudeOAuthUsageResponse = serde_json::from_str(json).unwrap();
+        let provider = claude_provider_from_usage(response);
+
+        assert!(provider
+            .usage_rows
+            .iter()
+            .any(|row| { row.id == "claude-routines" && row.percent_left == Some(86.0) }));
+    }
+
+    #[test]
+    fn filters_invalid_duplicate_and_all_models_scoped_limits() {
+        let json = r#"{
+          "five_hour": { "utilization": 9, "resets_at": "2100-01-01T00:00:00Z" },
+          "limits": [
+            {
+              "kind": "weekly_scoped", "group": "weekly", "percent": 14,
+              "scope": { "model": { "id": "claude/fable.5:promo", "display_name": "Fable" } }
+            },
+            {
+              "kind": "weekly_scoped", "group": "weekly", "percent": 20,
+              "scope": { "model": { "id": "claude/fable.5:promo", "display_name": "Fable renamed" } }
+            },
+            {
+              "kind": "weekly_scoped", "group": "weekly", "percent": 5,
+              "scope": { "model": { "id": "all-models", "display_name": "All models" } }
+            },
+            {
+              "kind": "weekly_all", "group": "weekly", "percent": 9,
+              "scope": null
+            }
+          ]
+        }"#;
+        let response: ClaudeOAuthUsageResponse = serde_json::from_str(json).unwrap();
+        let provider = claude_provider_from_usage(response);
+        let scoped: Vec<_> = provider
+            .usage_rows
+            .iter()
+            .filter(|row| row.id.starts_with("claude-weekly-scoped-"))
+            .collect();
+
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].id, "claude-weekly-scoped-claude-fable-5-promo");
+        assert_eq!(scoped[0].title, "Fable only");
+        assert_eq!(scoped[0].percent_left, Some(86.0));
     }
 
     #[test]
