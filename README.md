@@ -178,7 +178,7 @@ pnpm tauri build --bundles deb,appimage
 
 The generated artifacts are written under `src-tauri/target/release/bundle/deb` and `src-tauri/target/release/bundle/appimage`.
 
-The `release-linux` GitHub Actions workflow builds these artifacts on Ubuntu 22.04, uploads them to the workflow run as `lilimit-ubuntu-packages`, and attaches them to a draft GitHub release. Run it manually from Actions, or push a tag like `lilimit-v0.1.0`, then publish the draft after checking the assets.
+The `release-linux` GitHub Actions workflow builds these artifacts on Ubuntu 22.04, uploads them to the workflow run as `lilimit-ubuntu-packages`, and attaches them to a draft GitHub release. Run it manually from Actions, or push a tag like `lilimit-v0.1.1`, then publish the draft after checking the assets.
 
 The same Makefile shortcuts work on Ubuntu:
 
