@@ -1,0 +1,81 @@
+name: release-macos
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  macos:
+    name: universal macOS package
+    runs-on: macos-14
+    env:
+      APPLE_SIGNING_IDENTITY: "-"
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10.28.0
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache Rust
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Require an existing draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        run: |
+          if [ -z "$RELEASE_TAG" ]; then
+            RELEASE_TAG="lilimit-v$(node -p "require('./package.json').version")"
+          fi
+          is_draft=$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)
+          test "$is_draft" = "true"
+
+      - name: Build and upload universal macOS DMG
+        uses: tauri-apps/tauri-action@v0.6.2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          args: --target universal-apple-darwin --bundles dmg
+          tagName: ${{ github.ref_type == 'tag' && github.ref_name || 'lilimit-v__VERSION__' }}
+          releaseName: lilimit v__VERSION__
+          releaseBody: |
+            Desktop packages for lilimit.
+
+            The macOS DMG is universal for Apple Silicon and Intel. It is ad-hoc signed and not notarized.
+          releaseDraft: true
+          prerelease: false
+
+      - name: Upload macOS workflow artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: lilimit-macos-packages
+          path: src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+          compression-level: 0

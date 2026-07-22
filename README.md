@@ -178,7 +178,7 @@ pnpm tauri build --bundles deb,appimage
 
 The generated artifacts are written under `src-tauri/target/release/bundle/deb` and `src-tauri/target/release/bundle/appimage`.
 
-The `release-linux` GitHub Actions workflow builds these artifacts on Ubuntu 22.04, uploads them to the workflow run as `lilimit-ubuntu-packages`, and attaches them to a draft GitHub release. Run it manually from Actions, or push a tag like `lilimit-v0.1.1`, then publish the draft after checking the assets.
+The `release-linux` GitHub Actions workflow builds these artifacts on Ubuntu 22.04, uploads them to the workflow run as `lilimit-ubuntu-packages`, and attaches them to a draft GitHub release. Push a tag like `lilimit-v0.1.2`, then run the `release-macos` workflow on the same tag. Publish the draft after checking both platforms.
 
 The same Makefile shortcuts work on Ubuntu:
 
@@ -189,6 +189,17 @@ make check
 make build
 make tauri-build
 ```
+
+## Build on macOS
+
+Install Xcode Command Line Tools, Node.js, pnpm, and Rust. Then build a local DMG:
+
+```sh
+pnpm install
+pnpm tauri build --bundles dmg
+```
+
+The `release-macos` GitHub Actions workflow builds one universal DMG for Apple Silicon and Intel, uploads it as `lilimit-macos-packages`, and attaches it to the draft created by `release-linux`. Repository releases use ad-hoc signing until Apple Developer signing and notarization credentials are configured, so macOS may require **Open Anyway** on first launch.
 
 ## Notes
 
