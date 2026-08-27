@@ -10,12 +10,12 @@ It does not integrate Hermes, does not import browser cookies, and does not scra
 
 For token and cost history, lilimit reads local data that already exists on disk:
 
-- On macOS, it reuses CodexBar's cost caches (`~/Library/Caches/CodexBar/cost-usage`) when present.
-- For Codex, it otherwise falls back to scanning Codex CLI session logs in `~/.codex/sessions`.
+- For Codex, it incrementally scans Codex CLI session logs in `~/.codex/sessions` (honoring `CODEX_HOME`) with a bounded per-refresh work budget.
+- For Claude, it scans Claude Code transcripts under the active Claude profile's `projects` directory.
 
-Codex credentials are read from `~/.codex/auth.json` (honoring `CODEX_HOME`). When the stored OAuth tokens are more than 8 days old or rejected, lilimit refreshes them against OpenAI's token endpoint and writes the result back to `~/.codex/auth.json` — the same file the Codex CLI maintains. The write is atomic (temp file + rename).
+Codex credentials are read-only from `~/.codex/auth.json` (honoring `CODEX_HOME`). ChatGPT OAuth and Codex personal access tokens are supported. lilimit never refreshes or rewrites this CLI-owned file; if credentials expire, use the settings sign-in action or run `codex login`.
 
-Claude credentials are read from `~/.claude/.credentials.json`, or from the `LILIMIT_CLAUDE_OAUTH_TOKEN` environment variable if set. lilimit never refreshes or rewrites Claude credentials; when they expire, run `claude` to refresh them.
+Claude credentials are read from the active Claude profile's `.credentials.json`, or from the `LILIMIT_CLAUDE_OAUTH_TOKEN` environment variable if set. `CLAUDE_CONFIG_DIR` and `CLAUDE_SECURESTORAGE_CONFIG_DIR` follow Claude Code's profile rules. lilimit never refreshes or rewrites Claude credentials; when they expire, run `claude auth login --claudeai`.
 
 The Accounts section in settings can start the official browser login flows for both providers. lilimit runs `codex login` for ChatGPT/Codex and `claude auth login --claudeai` for a Claude subscription, then immediately fetches account and usage information from the providers' usage APIs. Login URLs, codes, and tokens are never returned to the webview or written to lilimit logs.
 
@@ -55,6 +55,8 @@ The in-widget settings button lets you choose:
 - Display mode: `Simple` or `Full`
 - Background: `Dark` or `Light`
 - Keychain: `Off` or `Allow`
+- Low power: `Off`, `On`, or `Auto` (Auto follows macOS Low Power Mode; other platforms treat Auto as off)
+- Daily Routines: show or hide Claude's optional quota row
 - Toolbar: `Bars` or `Text`
 - Scale: `80%` to `200%` (stepper in 10% steps, or drag the widget's corner grip)
 
@@ -62,7 +64,9 @@ The in-widget settings button lets you choose:
 
 `Scale` grows or shrinks the whole widget — window, fonts, meters, and charts together — which is handy when the default size is too small on high-resolution Ubuntu displays. It resizes the window and applies a matching webview zoom, so the layout stays sharp. You can step the scale from settings, or drag the resize grip in the widget's bottom-right corner to size it directly — the window and its contents grow together. The effective scale is capped to the monitor work area so the widget never grows past the visible screen, and the settings window itself stays at native size. Webview zoom needs macOS 11+ (Linux is fine); on older macOS the window only resizes.
 
-Keychain access is off by default. On macOS, `Allow` lets lilimit try a short, explicit read of Claude Code's `Claude Code-credentials` Keychain item if `~/.claude/.credentials.json` is missing. This is not Chrome cookie access. Ubuntu builds ignore macOS Keychain reads.
+Keychain access is off by default. On macOS, `Allow` lets lilimit try a short, explicit read of Claude Code's `Claude Code-credentials` Keychain item if the active profile's `.credentials.json` is missing. This is not Chrome cookie access. Ubuntu builds ignore macOS Keychain reads.
+
+Low Power Mode is off by default. When effective, automatic collection uses a 30-minute cadence instead of 5 minutes; manual refreshes still run immediately. Claude rate-limit backoff remains in force.
 
 Claude retry/backoff state is stored locally as `collector_state.json` next to `settings.json` and `collected_snapshot.json`.
 
@@ -207,9 +211,9 @@ The `release-macos` GitHub Actions workflow builds one universal DMG for Apple S
 - Simple mode is 280x140. Full mode is 360x560 so detailed usage rows have room to breathe.
 - macOS shows a lilimit status item in the menu bar. The toolbar display can be compact bars or text like `Codex 29%  Claude 58%`; otherwise it falls back to the lilimit icon. Use the status item to show, hide, or quit the widget.
 - Press `Cmd+Shift+L` on macOS or `Ctrl+Shift+L` on Linux to show or hide the widget.
-- lilimit refreshes `collected_snapshot.json` at most every 5 minutes from local CLI OAuth credentials.
-- Codex usage is read from the OAuth tokens in `~/.codex/auth.json` and fetched from the ChatGPT usage endpoint. API-key-only Codex auth cannot read these usage stats.
-- Claude usage is read from `~/.claude/.credentials.json` and fetched from Anthropic's OAuth usage endpoint. On macOS, optional Keychain access can read Claude Code's credential item when explicitly enabled. Claude Code owns these credentials, so lilimit does not refresh expired Claude OAuth tokens directly; use the settings sign-in action or run `claude auth login --claudeai` to re-authenticate. Claude refreshes are rate-limited to 5 minutes, and Anthropic `429` responses use exponential backoff while keeping the last successful Claude data visible as stale.
+- lilimit refreshes `collected_snapshot.json` at most every 5 minutes normally or every 30 minutes in effective Low Power Mode.
+- Codex usage is read from ChatGPT OAuth or personal-access-token credentials in `~/.codex/auth.json` and fetched from the ChatGPT usage endpoint. API-key-only Codex auth cannot read these usage stats.
+- Claude usage is read from the active profile's `.credentials.json` and fetched from Anthropic's OAuth usage endpoint. On macOS, optional Keychain access can read Claude Code's credential item when explicitly enabled. Claude Code owns these credentials, so lilimit does not refresh expired Claude OAuth tokens directly; use the settings sign-in action or run `claude auth login --claudeai` to re-authenticate. Claude refreshes are rate-limited to 5 minutes, and Anthropic `429` responses use exponential backoff while keeping the last successful Claude data visible as stale.
 - Browser cookie import and Chrome Keychain cookie decryption are intentionally not implemented; lilimit uses local CLI OAuth credentials instead.
 - Display preferences and the last reported window position are stored in lilimit's local `settings.json`.
 - Always-on-top behavior is compositor-dependent on Ubuntu. GNOME on X11 usually honors it more consistently than GNOME on Wayland.
@@ -217,6 +221,6 @@ The `release-macos` GitHub Actions workflow builds one universal DMG for Apple S
 - Restoring a saved position is also compositor-dependent on Ubuntu Wayland; macOS and GNOME X11 are generally more predictable.
 - Tray/status icons and tray text on Ubuntu GNOME are desktop-extension/session dependent. GNOME Wayland may require AppIndicator-style support for the icon to appear, and may not show the compact text title even when lilimit updates it. Toolbar bars are rendered as an icon and are usually more portable than tray text.
 - The window uses an opaque compact background because transparent frameless windows are less reliable across Linux desktop environments.
-- The widget refreshes data every 5 minutes and marks data as stale when `updatedAt` is older than 15 minutes.
+- The widget polls every 5 minutes; the collector's effective cadence can be 30 minutes in Low Power Mode. Provider errors preserve the last usable snapshot as stale when safe.
 - Missing collector output shows `No usage data yet` with the expected platform path. Invalid JSON is reported inside the widget.
 - Hermes integration is intentionally not implemented yet.

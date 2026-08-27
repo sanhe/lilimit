@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     env, fs,
-    io::{BufRead, BufReader, Read, Write},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -13,8 +13,10 @@ use std::{
 };
 
 use chrono::{DateTime, Days, Local, NaiveDate, SecondsFormat, Utc};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use serde_json::json;
+use serde_json::Value;
 use tauri::{
     image::Image,
     menu::{Menu, MenuItem, PredefinedMenuItem},
@@ -39,6 +41,7 @@ const MIN_SCALE: f64 = 0.8;
 const MAX_SCALE: f64 = 2.0;
 const DEFAULT_SCALE: f64 = 1.0;
 const COLLECTION_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const LOW_POWER_REFRESH_INTERVAL: Duration = Duration::from_secs(30 * 60);
 // The widget polls at the same 5-minute period, but updatedAt is stamped when
 // a collection *finishes*, so each tick would find a snapshot a few seconds
 // younger than the full window and skip every other collection (an effective
@@ -47,16 +50,18 @@ const COLLECTION_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const COLLECTION_FRESHNESS_TOLERANCE: Duration = Duration::from_secs(45);
 const WINDOW_POSITION_FLUSH_DELAY: Duration = Duration::from_millis(500);
 const CLAUDE_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const LOCAL_HISTORY_REFRESH_INTERVAL: Duration = Duration::from_secs(15 * 60);
+const CODEX_LOCAL_SCAN_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
 const CLAUDE_RATE_LIMIT_BASE_BACKOFF: Duration = Duration::from_secs(5 * 60);
 const CLAUDE_RATE_LIMIT_MAX_BACKOFF: Duration = Duration::from_secs(6 * 60 * 60);
 const CLAUDE_WEEK_MINUTES: f64 = 7.0 * 24.0 * 60.0;
 const CLI_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 const CLI_LOGIN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-const CODEX_AUTH_REFRESH_AFTER_DAYS: i64 = 8;
-const CODEX_REFRESH_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
-const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CODEX_DEFAULT_CHATGPT_BASE_URL: &str = "https://chatgpt.com/backend-api";
+const CODEX_PAT_WHOAMI_URL: &str =
+    "https://auth.openai.com/api/accounts/v1/user-auth-credential/whoami";
 const CLAUDE_OAUTH_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+const CLAUDE_OAUTH_PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
 #[cfg(target_os = "macos")]
 const CLAUDE_KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 #[cfg(target_os = "macos")]
@@ -116,6 +121,18 @@ fn default_keychain_access() -> KeychainAccess {
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+enum LowPowerMode {
+    Off,
+    On,
+    Automatic,
+}
+
+fn default_low_power_mode() -> LowPowerMode {
+    LowPowerMode::Off
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 enum ToolbarDisplay {
     Text,
     Bars,
@@ -145,6 +162,10 @@ struct WidgetSettings {
     background: WidgetBackground,
     #[serde(default = "default_keychain_access")]
     keychain_access: KeychainAccess,
+    #[serde(default = "default_low_power_mode")]
+    low_power_mode: LowPowerMode,
+    #[serde(default)]
+    hide_claude_routines: bool,
     #[serde(default = "default_toolbar_display")]
     toolbar_display: ToolbarDisplay,
     // UI scale factor applied as native webview zoom plus a matching window
@@ -162,6 +183,8 @@ impl Default for WidgetSettings {
             display_mode: DisplayMode::Simple,
             background: WidgetBackground::Dark,
             keychain_access: KeychainAccess::Off,
+            low_power_mode: LowPowerMode::Off,
+            hide_claude_routines: false,
             toolbar_display: ToolbarDisplay::Bars,
             scale: DEFAULT_SCALE,
             window_position: None,
@@ -1246,6 +1269,35 @@ where
     }
 }
 
+fn optional_i64_from_json<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(number)) => number
+            .as_i64()
+            .or_else(|| number.as_u64().and_then(|value| i64::try_from(value).ok()))
+            .ok_or_else(|| serde::de::Error::custom("expected integer"))
+            .map(Some),
+        Some(Value::String(raw)) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                trimmed
+                    .parse::<i64>()
+                    .map(Some)
+                    .map_err(serde::de::Error::custom)
+            }
+        }
+        _ => Err(serde::de::Error::custom(
+            "expected integer or integer string",
+        )),
+    }
+}
+
 #[derive(Debug)]
 enum UsageFetchError {
     Unauthorized,
@@ -1273,11 +1325,19 @@ impl std::fmt::Display for UsageFetchError {
 #[derive(Debug, Clone)]
 struct CodexCredentials {
     access_token: String,
-    refresh_token: String,
-    id_token: Option<String>,
     account_id: Option<String>,
-    last_refresh: Option<DateTime<Utc>>,
-    path: PathBuf,
+    is_personal_access_token: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct CodexPatWhoami {
+    #[serde(default)]
+    chatgpt_account_id: Option<String>,
+    #[serde(default)]
+    chatgpt_plan_type: Option<String>,
+    #[serde(default)]
+    email: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1293,6 +1353,8 @@ struct ClaudeCredentials {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 struct CodexUsageApiResponse {
+    #[serde(default, alias = "accountId")]
+    account_id: Option<String>,
     #[serde(default)]
     email: Option<String>,
     #[serde(default)]
@@ -1301,6 +1363,12 @@ struct CodexUsageApiResponse {
     rate_limit: Option<CodexRateLimitDetails>,
     #[serde(default)]
     credits: Option<CodexCreditDetails>,
+    #[serde(default, alias = "individualLimit")]
+    individual_limit: Option<CodexSpendControlLimit>,
+    #[serde(default, alias = "spendControl")]
+    spend_control: Option<CodexSpendControlDetails>,
+    #[serde(default)]
+    additional_rate_limits: Vec<CodexAdditionalRateLimit>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1310,17 +1378,82 @@ struct CodexRateLimitDetails {
     primary_window: Option<CodexUsageWindow>,
     #[serde(default)]
     secondary_window: Option<CodexUsageWindow>,
+    #[serde(default, alias = "individualLimit")]
+    individual_limit: Option<CodexSpendControlLimit>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
 struct CodexUsageWindow {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "optional_f64_from_json")]
     used_percent: Option<f64>,
-    #[serde(default)]
+    #[serde(
+        default,
+        alias = "resets_at",
+        alias = "resetsAt",
+        deserialize_with = "optional_i64_from_json"
+    )]
     reset_at: Option<i64>,
     #[serde(default)]
     limit_window_seconds: Option<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct CodexSpendControlLimit {
+    #[serde(default, deserialize_with = "optional_f64_from_json")]
+    limit: Option<f64>,
+    #[serde(default, deserialize_with = "optional_f64_from_json")]
+    used: Option<f64>,
+    #[serde(
+        default,
+        alias = "remainingPercent",
+        deserialize_with = "optional_f64_from_json"
+    )]
+    remaining_percent: Option<f64>,
+    #[serde(
+        default,
+        alias = "resets_at",
+        alias = "resetsAt",
+        deserialize_with = "optional_i64_from_json"
+    )]
+    reset_at: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct CodexSpendControlDetails {
+    #[serde(default, alias = "individualLimit")]
+    individual_limit: Option<CodexSpendControlLimit>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct CodexAdditionalRateLimit {
+    #[serde(default)]
+    limit_name: Option<String>,
+    #[serde(default)]
+    metered_feature: Option<String>,
+    #[serde(default)]
+    rate_limit: Option<CodexRateLimitDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct CodexMonthlyUsageResponse {
+    #[serde(default, deserialize_with = "optional_f64_from_json")]
+    current_month_usage: Option<f64>,
+    #[serde(default)]
+    effective_monthly_limit: Option<CodexEffectiveMonthlyLimit>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct CodexEffectiveMonthlyLimit {
+    #[serde(default, deserialize_with = "optional_f64_from_json")]
+    limit: Option<f64>,
+    #[serde(default)]
+    enforcement_mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1328,30 +1461,6 @@ struct CodexUsageWindow {
 struct CodexCreditDetails {
     #[serde(default, deserialize_with = "optional_f64_from_json")]
     balance: Option<f64>,
-}
-
-#[derive(Debug, Clone, Default)]
-struct OptionalClaudeOAuthWindow {
-    value: Option<ClaudeOAuthWindow>,
-    present: bool,
-}
-
-impl<'de> Deserialize<'de> for OptionalClaudeOAuthWindow {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        Ok(Self {
-            value: Option::<ClaudeOAuthWindow>::deserialize(deserializer)?,
-            present: true,
-        })
-    }
-}
-
-impl OptionalClaudeOAuthWindow {
-    fn as_ref(&self) -> Option<&ClaudeOAuthWindow> {
-        self.value.as_ref()
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1367,19 +1476,19 @@ struct ClaudeOAuthUsageResponse {
     #[serde(default)]
     seven_day_sonnet: Option<ClaudeOAuthWindow>,
     #[serde(default)]
-    seven_day_routines: OptionalClaudeOAuthWindow,
+    seven_day_routines: Option<ClaudeOAuthWindow>,
     #[serde(default)]
-    seven_day_claude_routines: OptionalClaudeOAuthWindow,
+    seven_day_claude_routines: Option<ClaudeOAuthWindow>,
     #[serde(default)]
-    claude_routines: OptionalClaudeOAuthWindow,
+    claude_routines: Option<ClaudeOAuthWindow>,
     #[serde(default)]
-    routines: OptionalClaudeOAuthWindow,
+    routines: Option<ClaudeOAuthWindow>,
     #[serde(default)]
-    routine: OptionalClaudeOAuthWindow,
+    routine: Option<ClaudeOAuthWindow>,
     #[serde(default)]
-    seven_day_cowork: OptionalClaudeOAuthWindow,
+    seven_day_cowork: Option<ClaudeOAuthWindow>,
     #[serde(default)]
-    cowork: OptionalClaudeOAuthWindow,
+    cowork: Option<ClaudeOAuthWindow>,
     #[serde(default)]
     limits: Vec<ClaudeOAuthLimit>,
     #[serde(default)]
@@ -1387,7 +1496,7 @@ struct ClaudeOAuthUsageResponse {
 }
 
 impl ClaudeOAuthUsageResponse {
-    fn routines_window(&self) -> Option<&OptionalClaudeOAuthWindow> {
+    fn routines_window(&self) -> Option<&ClaudeOAuthWindow> {
         let aliases = [
             &self.seven_day_routines,
             &self.seven_day_claude_routines,
@@ -1397,14 +1506,7 @@ impl ClaudeOAuthUsageResponse {
             &self.seven_day_cowork,
             &self.cowork,
         ];
-        // Prefer a populated alias over an earlier null one. If every known
-        // alias is null, retain the first present key so the UI can show the
-        // product lane at 100% remaining, matching CodexBar.
-        aliases
-            .iter()
-            .copied()
-            .find(|window| window.value.is_some())
-            .or_else(|| aliases.into_iter().find(|window| window.present))
+        aliases.into_iter().find_map(Option::as_ref)
     }
 }
 
@@ -1469,16 +1571,21 @@ async fn refresh_collected_usage_snapshot(
 async fn collect_usage_snapshot(
     app: AppHandle,
     force: Option<bool>,
-    bypass_claude_throttle: bool,
+    bypass_claude_backoff: bool,
 ) -> Result<UsageSnapshotResponse, String> {
     let force = force.unwrap_or(false);
     let settings = read_widget_settings().unwrap_or_default();
     let previous_snapshot = read_collected_usage_snapshot_file().unwrap_or(None);
     if !force {
+        let refresh_interval = if low_power_mode_is_effective(settings.low_power_mode) {
+            LOW_POWER_REFRESH_INTERVAL
+        } else {
+            COLLECTION_REFRESH_INTERVAL
+        };
         if let Some(snapshot) = previous_snapshot.as_ref() {
             if snapshot_is_fresh(
                 snapshot,
-                COLLECTION_REFRESH_INTERVAL.saturating_sub(COLLECTION_FRESHNESS_TOLERANCE),
+                refresh_interval.saturating_sub(COLLECTION_FRESHNESS_TOLERANCE),
             ) {
                 let response = response_from_snapshot_file(snapshot)?;
                 sync_tray_title_from_response(&app, &response);
@@ -1503,13 +1610,14 @@ async fn collect_usage_snapshot(
         .and_then(|snapshot| snapshot_provider(snapshot, "Claude"))
         .cloned();
 
-    let codex_result = collect_codex_provider(&client, previous_codex).await;
+    let codex_result = collect_codex_provider(&client, previous_codex, force).await;
     let claude_result = collect_claude_provider(
         &client,
         settings.keychain_access,
         previous_claude,
         &mut collector_state,
-        bypass_claude_throttle,
+        force,
+        bypass_claude_backoff,
     )
     .await;
     write_collector_state(&collector_state)?;
@@ -1609,9 +1717,9 @@ async fn login_provider(
         ));
     }
 
-    // A manual settings refresh keeps Claude's five-minute guard intact. A
-    // completed login is the one case where fetching immediately is required:
-    // bypass the old credential's cache/backoff and load the new account now.
+    // Manual refreshes bypass the five-minute provider cache. A completed login
+    // additionally bypasses the old credential's backoff so the new account is
+    // loaded immediately.
     let refresh_result =
         collect_usage_snapshot(app, Some(true), provider == LoginProvider::Claude).await;
     let (snapshot, refresh_error) = match refresh_result {
@@ -1695,6 +1803,35 @@ fn timestamp_is_within(value: &str, interval: Duration) -> bool {
     age_seconds >= 0 && age_seconds < interval.as_secs() as i64
 }
 
+fn low_power_mode_is_effective(mode: LowPowerMode) -> bool {
+    match mode {
+        LowPowerMode::Off => false,
+        LowPowerMode::On => true,
+        LowPowerMode::Automatic => system_low_power_mode_enabled(),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn system_low_power_mode_enabled() -> bool {
+    Command::new("/usr/bin/pmset")
+        .args(["-g"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .is_some_and(|output| {
+            output.lines().any(|line| {
+                let mut fields = line.split_whitespace();
+                fields.next() == Some("lowpowermode") && fields.next() == Some("1")
+            })
+        })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn system_low_power_mode_enabled() -> bool {
+    false
+}
+
 fn snapshot_provider<'a>(snapshot: &'a UsageSnapshotFile, name: &str) -> Option<&'a ProviderUsage> {
     snapshot
         .providers
@@ -1714,8 +1851,9 @@ enum ProviderCollectionResult {
 async fn collect_codex_provider(
     client: &reqwest::Client,
     previous: Option<ProviderUsage>,
+    force_local_scan: bool,
 ) -> ProviderCollectionResult {
-    match fetch_codex_provider(client).await {
+    match fetch_codex_provider(client, force_local_scan).await {
         Ok(provider) => ProviderCollectionResult::Provider(provider),
         Err(error) => {
             let message = error.to_string();
@@ -1738,9 +1876,10 @@ async fn collect_claude_provider(
     keychain_access: KeychainAccess,
     previous: Option<ProviderUsage>,
     collector_state: &mut CollectorState,
-    bypass_throttle: bool,
+    bypass_cache: bool,
+    bypass_backoff: bool,
 ) -> ProviderCollectionResult {
-    if !bypass_throttle {
+    if !bypass_cache {
         if let Some(provider) = previous.as_ref() {
             if provider
                 .updated_at
@@ -1750,7 +1889,9 @@ async fn collect_claude_provider(
                 return ProviderCollectionResult::Provider(provider.clone());
             }
         }
+    }
 
+    if !bypass_backoff {
         if let Some(next_attempt_at) = claude_backoff_until(collector_state) {
             let warning = format!(
                 "rate limited; retry {}",
@@ -1766,7 +1907,7 @@ async fn collect_claude_provider(
         }
     }
 
-    match fetch_claude_provider(client, keychain_access).await {
+    match fetch_claude_provider(client, keychain_access, bypass_cache).await {
         Ok(provider) => {
             collector_state.claude_next_attempt_at = None;
             collector_state.claude_rate_limit_failures = 0;
@@ -1856,29 +1997,60 @@ fn is_transient_fetch_error(message: &str) -> bool {
         || lower.contains("http 504")
 }
 
-async fn fetch_codex_provider(client: &reqwest::Client) -> Result<ProviderUsage, UsageFetchError> {
-    let mut credentials = load_codex_credentials().map_err(UsageFetchError::Message)?;
-    if codex_credentials_need_refresh(&credentials) {
-        credentials = refresh_codex_credentials(client, &credentials).await?;
-        save_codex_credentials(&credentials).map_err(UsageFetchError::Message)?;
-    }
-
-    let response = match fetch_codex_usage(client, &credentials).await {
-        Ok(response) => response,
-        Err(UsageFetchError::Unauthorized) if !credentials.refresh_token.is_empty() => {
-            let refreshed = refresh_codex_credentials(client, &credentials).await?;
-            save_codex_credentials(&refreshed).map_err(UsageFetchError::Message)?;
-            fetch_codex_usage(client, &refreshed).await?
-        }
-        Err(error) => return Err(error),
+async fn fetch_codex_provider(
+    client: &reqwest::Client,
+    force_local_scan: bool,
+) -> Result<ProviderUsage, UsageFetchError> {
+    let credentials = load_codex_credentials().map_err(UsageFetchError::Message)?;
+    let mut identity = None;
+    let account_id = if credentials.is_personal_access_token {
+        let whoami = fetch_codex_pat_whoami(client, &credentials.access_token).await?;
+        let account_id = non_empty_owned(whoami.chatgpt_account_id.clone());
+        identity = Some(whoami);
+        account_id
+    } else {
+        credentials.account_id.clone()
     };
 
-    // Reading Codex's local session logs walks the filesystem and parses JSONL;
-    // keep that off the async runtime's worker threads, like the Claude path.
-    // On Linux (no CodexBar cache) this fallback runs on every refresh.
-    let local_usage = tauri::async_runtime::spawn_blocking(load_codex_local_token_usage)
+    let mut response = fetch_codex_usage(client, &credentials.access_token, account_id.as_deref())
         .await
-        .map_err(|error| UsageFetchError::Message(error.to_string()))?;
+        .map_err(|error| match error {
+            UsageFetchError::Unauthorized => UsageFetchError::AuthenticationRequired(
+                "Codex credentials were rejected. Run `codex login` to refresh them.".to_string(),
+            ),
+            other => other,
+        })?;
+    if let Some(identity) = identity {
+        response.email = non_empty_owned(identity.email).or(response.email);
+        response.plan_type = non_empty_owned(identity.chatgpt_plan_type).or(response.plan_type);
+    }
+    if resolved_codex_spend_limit(&response).is_none()
+        && response.spend_control.is_some()
+        && codex_plan_supports_monthly_limit(response.plan_type.as_deref())
+    {
+        let monthly_account_id = response
+            .account_id
+            .as_deref()
+            .or(account_id.as_deref())
+            .or(credentials.account_id.as_deref());
+        if let Some(monthly_account_id) = monthly_account_id {
+            if let Ok(limit) =
+                fetch_codex_monthly_limit(client, &credentials.access_token, monthly_account_id)
+                    .await
+            {
+                response.individual_limit = limit;
+            }
+        }
+    }
+
+    // Reading Codex's local session logs walks the filesystem and parses JSONL;
+    // keep that off the async runtime's worker threads. Automatic local-history
+    // scans have a 15-minute energy floor; manual refreshes run immediately.
+    let local_usage = tauri::async_runtime::spawn_blocking(move || {
+        cached_codex_local_token_usage(force_local_scan)
+    })
+    .await
+    .map_err(|error| UsageFetchError::Message(error.to_string()))?;
     Ok(codex_provider_from_usage_with_local_usage(
         response,
         local_usage,
@@ -1895,6 +2067,20 @@ fn load_codex_credentials() -> Result<CodexCredentials, String> {
         }
     })?;
     let value: Value = serde_json::from_str(&contents).map_err(|error| error.to_string())?;
+    parse_codex_credentials_value(&value)
+}
+
+fn parse_codex_credentials_value(value: &Value) -> Result<CodexCredentials, String> {
+    let personal_access_token = string_at(value, &["personal_access_token"])
+        .or_else(|| string_at(value, &["personalAccessToken"]))
+        .and_then(|value| non_empty_owned(Some(value)));
+    if let Some(access_token) = personal_access_token {
+        return Ok(CodexCredentials {
+            access_token,
+            account_id: None,
+            is_personal_access_token: true,
+        });
+    }
 
     let tokens = value.get("tokens").ok_or_else(|| {
         if value.get("OPENAI_API_KEY").is_some() {
@@ -1906,20 +2092,11 @@ fn load_codex_credentials() -> Result<CodexCredentials, String> {
     let access_token = string_at(tokens, &["access_token"])
         .or_else(|| string_at(tokens, &["accessToken"]))
         .ok_or_else(|| "Codex OAuth access token missing. Run `codex` to log in.".to_string())?;
-    let refresh_token = string_at(tokens, &["refresh_token"])
-        .or_else(|| string_at(tokens, &["refreshToken"]))
-        .unwrap_or_default();
-
     Ok(CodexCredentials {
         access_token,
-        refresh_token,
-        id_token: string_at(tokens, &["id_token"]).or_else(|| string_at(tokens, &["idToken"])),
         account_id: string_at(tokens, &["account_id"])
             .or_else(|| string_at(tokens, &["accountId"])),
-        last_refresh: string_at(&value, &["last_refresh"])
-            .or_else(|| string_at(&value, &["lastRefresh"]))
-            .and_then(|raw| parse_rfc3339_datetime(&raw)),
-        path,
+        is_personal_access_token: false,
     })
 }
 
@@ -1934,109 +2111,48 @@ fn codex_home_dir() -> Result<PathBuf, String> {
     Ok(PathBuf::from(home).join(".codex"))
 }
 
-fn codex_credentials_need_refresh(credentials: &CodexCredentials) -> bool {
-    if credentials.refresh_token.is_empty() {
-        return false;
-    }
-    match credentials.last_refresh {
-        Some(last_refresh) => {
-            Utc::now().signed_duration_since(last_refresh).num_days()
-                >= CODEX_AUTH_REFRESH_AFTER_DAYS
-        }
-        None => true,
-    }
-}
-
-async fn refresh_codex_credentials(
+async fn fetch_codex_pat_whoami(
     client: &reqwest::Client,
-    credentials: &CodexCredentials,
-) -> Result<CodexCredentials, UsageFetchError> {
-    if credentials.refresh_token.is_empty() {
-        return Err(UsageFetchError::Message(
-            "Codex OAuth refresh token missing. Run `codex` to log in.".to_string(),
-        ));
-    }
-
+    token: &str,
+) -> Result<CodexPatWhoami, UsageFetchError> {
     let response = client
-        .post(CODEX_REFRESH_ENDPOINT)
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .json(&json!({
-            "client_id": CODEX_OAUTH_CLIENT_ID,
-            "grant_type": "refresh_token",
-            "refresh_token": credentials.refresh_token,
-            "scope": "openid profile email"
-        }))
+        .get(CODEX_PAT_WHOAMI_URL)
+        .bearer_auth(token)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .header(reqwest::header::USER_AGENT, "codex_cli_rs/lilimit")
+        .header("originator", "codex_cli_rs")
         .send()
         .await
         .map_err(|error| UsageFetchError::Message(error.to_string()))?;
-
     let status = response.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Err(UsageFetchError::Unauthorized);
+    }
     if !status.is_success() {
         return Err(UsageFetchError::Message(format!(
-            "Codex OAuth refresh failed with HTTP {}. Run `codex` to log in again.",
+            "Codex PAT identity API returned HTTP {}",
             status.as_u16()
         )));
     }
-
-    let body: Value = response
-        .json()
+    response
+        .json::<CodexPatWhoami>()
         .await
-        .map_err(|error| UsageFetchError::Message(error.to_string()))?;
-    let access_token =
-        string_at(&body, &["access_token"]).unwrap_or_else(|| credentials.access_token.clone());
-    let refresh_token =
-        string_at(&body, &["refresh_token"]).unwrap_or_else(|| credentials.refresh_token.clone());
-    let id_token = string_at(&body, &["id_token"]).or_else(|| credentials.id_token.clone());
-
-    Ok(CodexCredentials {
-        access_token,
-        refresh_token,
-        id_token,
-        account_id: credentials.account_id.clone(),
-        last_refresh: Some(Utc::now()),
-        path: credentials.path.clone(),
-    })
-}
-
-fn save_codex_credentials(credentials: &CodexCredentials) -> Result<(), String> {
-    let contents = fs::read_to_string(&credentials.path).unwrap_or_else(|_| "{}".to_string());
-    let mut value: Value = serde_json::from_str(&contents).unwrap_or_else(|_| json!({}));
-    let mut tokens = value.get("tokens").cloned().unwrap_or_else(|| json!({}));
-
-    set_string(
-        &mut tokens,
-        "access_token",
-        Some(credentials.access_token.clone()),
-    );
-    set_string(
-        &mut tokens,
-        "refresh_token",
-        Some(credentials.refresh_token.clone()),
-    );
-    set_string(&mut tokens, "id_token", credentials.id_token.clone());
-    set_string(&mut tokens, "account_id", credentials.account_id.clone());
-    value["tokens"] = tokens;
-    value["last_refresh"] = Value::String(now_iso_string());
-
-    let serialized = serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?;
-    write_atomic(&credentials.path, &serialized, 0o600)
+        .map_err(|error| UsageFetchError::Message(error.to_string()))
 }
 
 async fn fetch_codex_usage(
     client: &reqwest::Client,
-    credentials: &CodexCredentials,
+    access_token: &str,
+    account_id: Option<&str>,
 ) -> Result<CodexUsageApiResponse, UsageFetchError> {
     let mut request = client
         .get(resolve_codex_usage_url())
-        .bearer_auth(&credentials.access_token)
+        .bearer_auth(access_token)
         .header(reqwest::header::ACCEPT, "application/json")
-        .header(reqwest::header::USER_AGENT, "lilimit");
+        .header(reqwest::header::USER_AGENT, "codex_cli_rs/lilimit")
+        .header("originator", "codex_cli_rs");
 
-    if let Some(account_id) = credentials
-        .account_id
-        .as_ref()
-        .filter(|value| !value.is_empty())
-    {
+    if let Some(account_id) = account_id.filter(|value| !value.is_empty()) {
         request = request.header("ChatGPT-Account-Id", account_id);
     }
 
@@ -2059,6 +2175,56 @@ async fn fetch_codex_usage(
         .json::<CodexUsageApiResponse>()
         .await
         .map_err(|error| UsageFetchError::Message(error.to_string()))
+}
+
+async fn fetch_codex_monthly_limit(
+    client: &reqwest::Client,
+    access_token: &str,
+    account_id: &str,
+) -> Result<Option<CodexSpendControlLimit>, UsageFetchError> {
+    let usage_url = resolve_codex_usage_url();
+    let normalized = usage_url
+        .strip_suffix("/wham/usage")
+        .or_else(|| usage_url.strip_suffix("/api/codex/usage"))
+        .unwrap_or(usage_url.trim_end_matches('/'));
+    let url =
+        format!("{normalized}/accounts/{account_id}/spend-controls/current-user/monthly-usage");
+    let response = client
+        .get(url)
+        .bearer_auth(access_token)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .header(reqwest::header::USER_AGENT, "codex_cli_rs/lilimit")
+        .header("originator", "codex_cli_rs")
+        .header("ChatGPT-Account-Id", account_id)
+        .send()
+        .await
+        .map_err(|error| UsageFetchError::Message(error.to_string()))?;
+    if !response.status().is_success() {
+        return Ok(None);
+    }
+    let monthly = response
+        .json::<CodexMonthlyUsageResponse>()
+        .await
+        .map_err(|error| UsageFetchError::Message(error.to_string()))?;
+    let effective = monthly.effective_monthly_limit;
+    let limit = effective.as_ref().and_then(|value| value.limit);
+    let inactive = effective
+        .as_ref()
+        .and_then(|value| value.enforcement_mode.as_deref())
+        .is_some_and(|mode| {
+            matches!(
+                mode.trim().to_ascii_lowercase().as_str(),
+                "none" | "off" | "disabled" | "no_limit"
+            )
+        });
+    Ok(
+        (!inactive && limit.is_some_and(|value| value > 0.0)).then_some(CodexSpendControlLimit {
+            limit,
+            used: monthly.current_month_usage,
+            remaining_percent: None,
+            reset_at: None,
+        }),
+    )
 }
 
 fn resolve_codex_usage_url() -> String {
@@ -2106,6 +2272,7 @@ fn codex_provider_from_usage_with_local_usage(
     response: CodexUsageApiResponse,
     local_usage: Option<(Option<TokenUsageSummary>, Vec<DailyUsagePoint>)>,
 ) -> ProviderUsage {
+    let monthly_limit = resolved_codex_spend_limit(&response).cloned();
     let primary_raw = response
         .rate_limit
         .as_ref()
@@ -2117,18 +2284,44 @@ fn codex_provider_from_usage_with_local_usage(
         .and_then(|details| details.secondary_window.as_ref())
         .and_then(rate_window_from_codex);
     let (primary, secondary) = normalize_codex_rate_windows(primary_raw, secondary_raw);
+    let monthly = monthly_limit.as_ref().and_then(codex_monthly_window);
     let mut usage_rows = Vec::new();
 
     if let Some(window) = primary.as_ref() {
-        usage_rows.push(usage_row_from_window("session", "Session", window));
+        let (id, title) = match codex_window_role(window) {
+            "weekly" => ("weekly", "Weekly"),
+            "monthly" => ("monthly", "Monthly"),
+            _ => ("session", "Session"),
+        };
+        usage_rows.push(usage_row_from_window(id, title, window));
     }
     if let Some(window) = secondary.as_ref() {
-        usage_rows.push(usage_row_from_window("weekly", "Weekly", window));
+        let (id, title) = match codex_window_role(window) {
+            "session" => ("session", "Session"),
+            "monthly" => ("monthly", "Monthly"),
+            _ => ("weekly", "Weekly"),
+        };
+        usage_rows.push(usage_row_from_window(id, title, window));
     }
+    if let Some(window) = monthly.as_ref() {
+        usage_rows.push(usage_row_from_window(
+            "monthly-credit",
+            "Monthly credit limit",
+            window,
+        ));
+    }
+    usage_rows.extend(codex_additional_usage_rows(
+        &response.additional_rate_limits,
+    ));
 
     let reset_text = primary
         .as_ref()
         .and_then(|window| window.reset_description.clone())
+        .or_else(|| {
+            monthly
+                .as_ref()
+                .and_then(|window| window.reset_description.clone())
+        })
         .unwrap_or_default();
     let (token_usage, daily_usage) = local_usage.unwrap_or((None, Vec::new()));
 
@@ -2139,14 +2332,22 @@ fn codex_provider_from_usage_with_local_usage(
             .plan_type
             .as_deref()
             .and_then(codex_plan_display_text),
-        session_left_percent: primary.as_ref().and_then(|window| window.percent_left),
-        weekly_left_percent: secondary.as_ref().and_then(|window| window.percent_left),
+        session_left_percent: primary.as_ref().and_then(|window| {
+            (codex_window_role(window) != "monthly")
+                .then_some(window.percent_left)
+                .flatten()
+        }),
+        weekly_left_percent: secondary.as_ref().and_then(|window| {
+            (codex_window_role(window) == "weekly")
+                .then_some(window.percent_left)
+                .flatten()
+        }),
         reset_text,
         updated_at: Some(now_iso_string()),
         usage_rows,
         primary,
         secondary,
-        tertiary: None,
+        tertiary: monthly,
         credits_remaining: response.credits.and_then(|credits| credits.balance),
         code_review_remaining_percent: None,
         token_usage,
@@ -2156,61 +2357,105 @@ fn codex_provider_from_usage_with_local_usage(
     }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CodexBarCostCache {
-    #[serde(default)]
-    days: HashMap<String, HashMap<String, Vec<i64>>>,
-    #[serde(default)]
-    files: HashMap<String, CodexBarCostFile>,
+fn resolved_codex_spend_limit(response: &CodexUsageApiResponse) -> Option<&CodexSpendControlLimit> {
+    response
+        .individual_limit
+        .as_ref()
+        .or_else(|| {
+            response
+                .rate_limit
+                .as_ref()
+                .and_then(|details| details.individual_limit.as_ref())
+        })
+        .or_else(|| {
+            response
+                .spend_control
+                .as_ref()
+                .and_then(|details| details.individual_limit.as_ref())
+        })
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CodexBarCostFile {
-    #[serde(default)]
-    codex_rows: Vec<CodexBarCodexRow>,
+fn codex_plan_supports_monthly_limit(plan: Option<&str>) -> bool {
+    !matches!(
+        plan.map(|value| value.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("guest" | "free" | "go" | "plus" | "pro")
+    )
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CodexBarCodexRow {
-    day: String,
-    model: String,
-    #[serde(default)]
-    input: i64,
-    #[serde(default)]
-    cached: i64,
-    #[serde(default)]
-    output: i64,
+fn codex_monthly_window(limit: &CodexSpendControlLimit) -> Option<RateWindowDetail> {
+    let cap = limit
+        .limit
+        .filter(|value| value.is_finite() && *value > 0.0)?;
+    let used = limit
+        .used
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.0)
+        .max(0.0);
+    let used_percent = limit
+        .remaining_percent
+        .filter(|value| value.is_finite())
+        .map(|remaining| 100.0 - remaining)
+        .unwrap_or((used / cap) * 100.0);
+    let resets_at = limit
+        .reset_at
+        .and_then(|seconds| DateTime::<Utc>::from_timestamp(seconds, 0));
+    let mut window =
+        rate_window_detail_from_parts(used_percent, Some(30.0 * 24.0 * 60.0), resets_at);
+    window.reset_description = Some(format!("${used:.2} / ${cap:.2}"));
+    Some(window)
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PiSessionCostCache {
-    #[serde(default)]
-    days_by_provider: HashMap<String, HashMap<String, HashMap<String, PiPackedUsage>>>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PiPackedUsage {
-    #[serde(default)]
-    input_tokens: i64,
-    #[serde(default)]
-    cache_read_tokens: i64,
-    #[serde(default)]
-    cache_write_tokens: i64,
-    #[serde(default)]
-    output_tokens: i64,
-    #[serde(default)]
-    total_tokens: i64,
-    #[serde(default)]
-    cost_nanos: i64,
-    #[serde(default)]
-    cost_sample_count: i64,
-    #[serde(default)]
-    usage_sample_count: Option<i64>,
+fn codex_additional_usage_rows(limits: &[CodexAdditionalRateLimit]) -> Vec<UsageRow> {
+    let mut seen = HashSet::new();
+    let mut rows = Vec::new();
+    for limit in limits {
+        let name = non_empty_trimmed(limit.limit_name.as_deref())
+            .or_else(|| non_empty_trimmed(limit.metered_feature.as_deref()))
+            .unwrap_or("Codex extra limit");
+        let is_spark = name.to_ascii_lowercase().contains("spark")
+            || limit
+                .metered_feature
+                .as_deref()
+                .is_some_and(|value| value.to_ascii_lowercase().contains("spark"));
+        let candidates = [
+            limit
+                .rate_limit
+                .as_ref()
+                .and_then(|details| details.primary_window.as_ref()),
+            limit
+                .rate_limit
+                .as_ref()
+                .and_then(|details| details.secondary_window.as_ref()),
+        ];
+        for (index, snapshot) in candidates.into_iter().enumerate() {
+            let Some(window) = snapshot.and_then(rate_window_from_codex) else {
+                continue;
+            };
+            let (id, title) = if is_spark {
+                let weekly = window
+                    .window_minutes
+                    .is_some_and(|minutes| minutes >= 6.0 * 24.0 * 60.0)
+                    || index == 1;
+                if weekly {
+                    (
+                        "codex-spark-weekly".to_string(),
+                        "Codex Spark Weekly".to_string(),
+                    )
+                } else {
+                    ("codex-spark".to_string(), "Codex Spark 5-hour".to_string())
+                }
+            } else {
+                let slug = claude_limit_slug(name);
+                let suffix = if index == 0 { "" } else { "-secondary" };
+                (format!("codex-{slug}{suffix}"), name.to_string())
+            };
+            if seen.insert(id.clone()) {
+                rows.push(usage_row_from_window(&id, &title, &window));
+            }
+        }
+    }
+    rows
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2251,7 +2496,7 @@ struct LocalModelUsage {
     cost_seen: bool,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct CodexTokenTotals {
     input: i64,
     cached: i64,
@@ -2286,34 +2531,6 @@ impl CodexTokenTotals {
     }
 }
 
-// CodexBar is a macOS menu bar app, so its cost caches only exist there.
-fn codexbar_cost_cache_dir() -> Option<PathBuf> {
-    #[cfg(target_os = "macos")]
-    {
-        Some(
-            home_dir()
-                .ok()?
-                .join("Library")
-                .join("Caches")
-                .join("CodexBar")
-                .join("cost-usage"),
-        )
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        None
-    }
-}
-
-type MergeCostCacheFn<Cache> = fn(
-    Cache,
-    NaiveDate,
-    NaiveDate,
-    &mut BTreeMap<String, LocalDayUsage>,
-    &mut HashMap<String, LocalModelUsage>,
-);
-
 type ScanSessionLogsFn = fn(
     NaiveDate,
     NaiveDate,
@@ -2321,13 +2538,10 @@ type ScanSessionLogsFn = fn(
     &mut HashMap<String, LocalModelUsage>,
 );
 
-// Codex and Claude local usage load the same way over the same 30-day window;
-// only the CodexBar cache file, the merge fns, and the session-log scanner
-// differ per provider.
+// CodexBar v0.49 migrated its usage history from the retired JSON snapshots to
+// SQLite. lilimit owns a small cross-platform scanner, so read the CLIs' source
+// JSONL directly instead of accidentally displaying a stale legacy cache.
 fn load_local_token_usage(
-    cost_cache_file: &str,
-    merge_cost_cache: MergeCostCacheFn<CodexBarCostCache>,
-    merge_pi_cache: MergeCostCacheFn<PiSessionCostCache>,
     scan_session_logs: ScanSessionLogsFn,
 ) -> Option<(Option<TokenUsageSummary>, Vec<DailyUsagePoint>)> {
     let today = Local::now().date_naive();
@@ -2335,43 +2549,65 @@ fn load_local_token_usage(
     let mut days: BTreeMap<String, LocalDayUsage> = BTreeMap::new();
     let mut models: HashMap<String, LocalModelUsage> = HashMap::new();
 
-    // CodexBar's cost caches only exist on macOS. Everywhere else (and on macOS
-    // when CodexBar isn't installed) fall back to the CLI's own session logs.
-    if let Some(cache_dir) = codexbar_cost_cache_dir() {
-        if let Some(cache) = read_json_file::<CodexBarCostCache>(&cache_dir.join(cost_cache_file)) {
-            merge_cost_cache(cache, since, today, &mut days, &mut models);
-        }
-
-        if let Some(cache) =
-            read_json_file::<PiSessionCostCache>(&cache_dir.join("pi-sessions-v2.json"))
-        {
-            merge_pi_cache(cache, since, today, &mut days, &mut models);
-        }
-    }
-
-    if days.is_empty() {
-        scan_session_logs(since, today, &mut days, &mut models);
-    }
+    scan_session_logs(since, today, &mut days, &mut models);
 
     summarize_local_token_usage(&days, &models)
 }
 
 fn load_codex_local_token_usage() -> Option<(Option<TokenUsageSummary>, Vec<DailyUsagePoint>)> {
-    load_local_token_usage(
-        "codex-v7.json",
-        merge_codexbar_cost_cache,
-        merge_pi_session_cost_cache,
-        scan_codex_session_logs,
-    )
+    load_local_token_usage(scan_codex_session_logs)
 }
 
 fn load_claude_local_token_usage() -> Option<(Option<TokenUsageSummary>, Vec<DailyUsagePoint>)> {
-    load_local_token_usage(
-        "claude-v2.json",
-        merge_claude_cost_cache,
-        merge_pi_claude_cost_cache,
-        scan_claude_session_logs,
+    load_local_token_usage(scan_claude_session_logs)
+}
+
+type LocalTokenUsage = Option<(Option<TokenUsageSummary>, Vec<DailyUsagePoint>)>;
+
+struct TimedLocalTokenUsage {
+    updated_at: Instant,
+    value: LocalTokenUsage,
+}
+
+fn cached_codex_local_token_usage(force: bool) -> LocalTokenUsage {
+    static CACHE: OnceLock<Mutex<Option<TimedLocalTokenUsage>>> = OnceLock::new();
+    cached_local_token_usage(
+        CACHE.get_or_init(|| Mutex::new(None)),
+        force,
+        load_codex_local_token_usage,
     )
+}
+
+fn cached_claude_local_token_usage(force: bool) -> LocalTokenUsage {
+    static CACHE: OnceLock<Mutex<Option<TimedLocalTokenUsage>>> = OnceLock::new();
+    cached_local_token_usage(
+        CACHE.get_or_init(|| Mutex::new(None)),
+        force,
+        load_claude_local_token_usage,
+    )
+}
+
+fn cached_local_token_usage(
+    cache: &Mutex<Option<TimedLocalTokenUsage>>,
+    force: bool,
+    load: fn() -> LocalTokenUsage,
+) -> LocalTokenUsage {
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !force {
+        if let Some(cached) = cache.as_ref() {
+            if cached.updated_at.elapsed() < LOCAL_HISTORY_REFRESH_INTERVAL {
+                return cached.value.clone();
+            }
+        }
+    }
+    let value = load();
+    *cache = Some(TimedLocalTokenUsage {
+        updated_at: Instant::now(),
+        value: value.clone(),
+    });
+    value
 }
 
 fn summarize_local_token_usage(
@@ -2463,9 +2699,23 @@ struct CodexUsageRecord {
     cost: Option<f64>,
 }
 
-fn codex_scan_cache() -> &'static Mutex<HashMap<PathBuf, ScanFileCache<CodexUsageRecord>>> {
-    static CACHE: OnceLock<Mutex<HashMap<PathBuf, ScanFileCache<CodexUsageRecord>>>> =
-        OnceLock::new();
+#[derive(Clone, Default)]
+struct CodexLineParserState {
+    current_model: String,
+    previous_total: Option<CodexTokenTotals>,
+    last_accepted_timestamp: Option<String>,
+}
+
+struct CodexIncrementalFileCache {
+    modified: Option<SystemTime>,
+    size: u64,
+    offset: u64,
+    entries: Vec<CodexUsageRecord>,
+    parser_state: CodexLineParserState,
+}
+
+fn codex_scan_cache() -> &'static Mutex<HashMap<PathBuf, CodexIncrementalFileCache>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, CodexIncrementalFileCache>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -2489,13 +2739,18 @@ fn scan_codex_session_logs(
             .map(|date| date >= file_since && date <= until)
             .unwrap_or(false)
     });
-    files.sort();
+    files.sort_by(|lhs, rhs| rhs.cmp(lhs));
     let mut cache = codex_scan_cache()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    prune_scan_cache(&mut cache, &files);
+    cache.retain(|path, _| files.contains(path));
+    let mut remaining_budget = CODEX_LOCAL_SCAN_BUDGET_BYTES;
     for path in &files {
-        for record in cached_file_entries(&mut cache, path, scan_codex_session_file) {
+        refresh_codex_scan_cache_entry(&mut cache, path, &mut remaining_budget);
+        let Some(entry) = cache.get(path) else {
+            continue;
+        };
+        for record in &entry.entries {
             if !day_key_in_range(&record.day_key, since, until) {
                 continue;
             }
@@ -2507,6 +2762,62 @@ fn scan_codex_session_logs(
                 record.tokens,
                 record.cost,
             );
+        }
+    }
+}
+
+fn refresh_codex_scan_cache_entry(
+    cache: &mut HashMap<PathBuf, CodexIncrementalFileCache>,
+    path: &Path,
+    remaining_budget: &mut u64,
+) {
+    let Ok(metadata) = fs::metadata(path) else {
+        cache.remove(path);
+        return;
+    };
+    let modified = metadata.modified().ok();
+    let size = metadata.len();
+    let reset = cache.get(path).is_some_and(|entry| {
+        size < entry.offset || (size == entry.size && entry.modified != modified)
+    });
+    if reset {
+        cache.remove(path);
+    }
+    let entry = cache
+        .entry(path.to_path_buf())
+        .or_insert_with(|| CodexIncrementalFileCache {
+            modified,
+            size,
+            offset: 0,
+            entries: Vec::new(),
+            parser_state: CodexLineParserState::default(),
+        });
+    entry.modified = modified;
+    entry.size = size;
+    if entry.offset >= size || *remaining_budget == 0 {
+        return;
+    }
+
+    let Ok(mut file) = fs::File::open(path) else {
+        return;
+    };
+    if file.seek(SeekFrom::Start(entry.offset)).is_err() {
+        return;
+    }
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    while entry.offset < size && *remaining_budget > 0 {
+        line.clear();
+        let Ok(bytes_read) = reader.read_line(&mut line) else {
+            break;
+        };
+        if bytes_read == 0 {
+            break;
+        }
+        entry.offset = entry.offset.saturating_add(bytes_read as u64);
+        *remaining_budget = remaining_budget.saturating_sub(bytes_read as u64);
+        if let Some(record) = parse_codex_session_line(&line, &mut entry.parser_state) {
+            entry.entries.push(record);
         }
     }
 }
@@ -2542,76 +2853,193 @@ fn collect_session_files<F: Fn(&Path) -> bool>(
     }
 }
 
-fn scan_codex_session_file(path: &Path) -> Vec<CodexUsageRecord> {
-    let mut records = Vec::new();
-    let Ok(file) = fs::File::open(path) else {
-        return records;
-    };
-    let reader = BufReader::new(file);
-    let mut current_model = String::new();
-    let mut previous_total: Option<CodexTokenTotals> = None;
-
-    for line in reader.lines().map_while(Result::ok) {
-        if !(line.contains("\"token_count\"") || line.contains("\"turn_context\"")) {
-            continue;
+fn parse_codex_session_line(
+    line: &str,
+    state: &mut CodexLineParserState,
+) -> Option<CodexUsageRecord> {
+    if !(line.contains("\"token_count\"")
+        || line.contains("\"turn_context\"")
+        || line.contains("\"usage\""))
+    {
+        return None;
+    }
+    let value = serde_json::from_str::<Value>(line).ok()?;
+    if value.get("type").is_none() {
+        let (totals, model) = codex_bare_usage_from_value(&value)?;
+        let timestamp = value
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .or_else(|| state.last_accepted_timestamp.clone())?;
+        let day_key = local_day_key_from_timestamp(&timestamp)?;
+        let model = model
+            .map(|value| normalize_codex_model(&value))
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "unknown".to_string());
+        let total_input = totals.input.saturating_add(totals.cached);
+        let tokens = total_input.saturating_add(totals.output);
+        if tokens <= 0 {
+            return None;
         }
-        let Ok(value) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
-
-        if value.get("type").and_then(Value::as_str) == Some("turn_context") {
-            if let Some(model) = string_at(&value, &["payload", "model"]) {
-                current_model = normalize_codex_model(&model);
-            }
-            continue;
-        }
-
-        let Some(payload) = value.get("payload") else {
-            continue;
-        };
-        if payload.get("type").and_then(Value::as_str) != Some("token_count") {
-            continue;
-        }
-
-        let Some(timestamp) = value.get("timestamp").and_then(Value::as_str) else {
-            continue;
-        };
-        let Some(day_key) = local_day_key_from_timestamp(timestamp) else {
-            continue;
-        };
-        let info = payload.get("info").filter(|value| !value.is_null());
-        let total = info
-            .and_then(|info| info.get("total_token_usage"))
-            .map(codex_totals_from_value);
-        let last = info
-            .and_then(|info| info.get("last_token_usage"))
-            .map(codex_totals_from_value);
-
-        let delta = if let Some(total) = total {
-            let delta = previous_total
-                .map(|previous| total.delta_from(previous))
-                .unwrap_or(total);
-            previous_total = Some(total);
-            delta
-        } else if let Some(last) = last {
-            previous_total = Some(previous_total.unwrap_or_default().add(last));
-            last
-        } else {
-            continue;
-        };
-
-        if current_model.is_empty() || delta.total_tokens() <= 0 {
-            continue;
-        }
-        let cost = codex_cost_usd(&current_model, delta.input, delta.cached, delta.output);
-        records.push(CodexUsageRecord {
+        state.last_accepted_timestamp = Some(timestamp);
+        let pricing_date = NaiveDate::parse_from_str(&day_key, "%Y-%m-%d").ok();
+        let cost = codex_cost_usd_at_date(
+            &model,
+            total_input,
+            totals.cached,
+            totals.output,
+            pricing_date,
+        );
+        return Some(CodexUsageRecord {
             day_key,
-            model: current_model.clone(),
-            tokens: delta.total_tokens(),
+            model: model.clone(),
+            tokens,
             cost,
         });
     }
-    records
+    if value.get("type").and_then(Value::as_str) == Some("turn_context") {
+        if let Some(model) = string_at(&value, &["payload", "model"]) {
+            state.current_model = normalize_codex_model(&model);
+        }
+        return None;
+    }
+    let payload = value.get("payload")?;
+    if payload.get("type").and_then(Value::as_str) != Some("token_count") {
+        return None;
+    }
+    let timestamp = value.get("timestamp").and_then(Value::as_str)?;
+    let day_key = local_day_key_from_timestamp(timestamp)?;
+    let info = payload.get("info").filter(|value| !value.is_null());
+    if state.current_model.is_empty() {
+        if let Some(model) = info.and_then(|info| string_at(info, &["model"])) {
+            state.current_model = normalize_codex_model(&model);
+        }
+    }
+    let total = info
+        .and_then(|info| info.get("total_token_usage"))
+        .map(codex_totals_from_value);
+    let last = info
+        .and_then(|info| info.get("last_token_usage"))
+        .map(codex_totals_from_value);
+    let delta = if let Some(total) = total {
+        if state.previous_total == Some(total) {
+            return None;
+        }
+        if let (Some(previous), Some(last)) = (state.previous_total, last) {
+            if codex_looks_like_stale_regression(total, previous, last) {
+                return None;
+            }
+        }
+        let delta = match (state.previous_total, last) {
+            (Some(previous), Some(last))
+                if total.input >= previous.input
+                    && total.cached >= previous.cached
+                    && total.output >= previous.output =>
+            {
+                let total_delta = total.delta_from(previous);
+                CodexTokenTotals {
+                    input: total_delta.input.min(last.input),
+                    cached: total_delta.cached.min(last.cached),
+                    output: total_delta.output.min(last.output),
+                }
+            }
+            (Some(previous), None) => total.delta_from(previous),
+            (_, Some(last)) => last,
+            (None, None) => total,
+        };
+        state.previous_total = Some(total);
+        delta
+    } else if let Some(last) = last {
+        state.previous_total = Some(state.previous_total.unwrap_or_default().add(last));
+        last
+    } else {
+        return None;
+    };
+    if state.current_model.is_empty() || delta.total_tokens() <= 0 {
+        return None;
+    }
+    state.last_accepted_timestamp = Some(timestamp.to_string());
+    let pricing_date = NaiveDate::parse_from_str(&day_key, "%Y-%m-%d").ok();
+    let cost = codex_cost_usd_at_date(
+        &state.current_model,
+        delta.input,
+        delta.cached,
+        delta.output,
+        pricing_date,
+    );
+    Some(CodexUsageRecord {
+        day_key,
+        model: state.current_model.clone(),
+        tokens: delta.total_tokens(),
+        cost,
+    })
+}
+
+fn codex_looks_like_stale_regression(
+    current: CodexTokenTotals,
+    previous: CodexTokenTotals,
+    last: CodexTokenTotals,
+) -> bool {
+    if current.input >= previous.input
+        && current.cached >= previous.cached
+        && current.output >= previous.output
+    {
+        return false;
+    }
+    let previous_total = previous
+        .input
+        .saturating_add(previous.cached)
+        .saturating_add(previous.output);
+    let current_total = current
+        .input
+        .saturating_add(current.cached)
+        .saturating_add(current.output);
+    let last_total = last
+        .input
+        .saturating_add(last.cached)
+        .saturating_add(last.output);
+    previous_total > 0
+        && current_total > 0
+        && last_total > 0
+        && (current_total.saturating_mul(100) >= previous_total.saturating_mul(98)
+            || current_total.saturating_add(last_total.saturating_mul(2)) >= previous_total)
+}
+
+fn codex_bare_usage_from_value(value: &Value) -> Option<(CodexTokenTotals, Option<String>)> {
+    let usage = value
+        .get("usage")
+        .or_else(|| value.get("data").and_then(|value| value.get("usage")))
+        .or_else(|| value.get("result").and_then(|value| value.get("usage")))
+        .or_else(|| value.get("response").and_then(|value| value.get("usage")))?;
+    let input = first_i64_at(usage, &["input_tokens", "prompt_tokens", "input"])?;
+    let output = first_i64_at(usage, &["output_tokens", "completion_tokens", "output"])?;
+    let cached = first_i64_at(
+        usage,
+        &[
+            "cached_input_tokens",
+            "cache_read_input_tokens",
+            "cached_tokens",
+        ],
+    )
+    .unwrap_or_default()
+    .max(0);
+    let totals = CodexTokenTotals {
+        input: input.max(0).saturating_sub(cached),
+        cached,
+        output: output.max(0),
+    };
+    if totals.input <= 0 && totals.cached <= 0 && totals.output <= 0 {
+        return None;
+    }
+    let model = string_at(value, &["model"])
+        .or_else(|| string_at(value, &["model_name"]))
+        .or_else(|| string_at(value, &["data", "model"]))
+        .or_else(|| string_at(value, &["data", "model_name"]));
+    Some((totals, model))
+}
+
+fn first_i64_at(value: &Value, keys: &[&str]) -> Option<i64> {
+    keys.iter().find_map(|key| i64_at(value, &[*key]))
 }
 
 fn codex_session_file_date(path: &Path) -> Option<NaiveDate> {
@@ -2625,7 +3053,7 @@ fn codex_session_file_date(path: &Path) -> Option<NaiveDate> {
 // carries `message.usage` token counts and `message.model`, so we can estimate
 // Claude cost at API rates the same way CodexBar does for its cached snapshot.
 fn claude_projects_dir() -> Option<PathBuf> {
-    Some(home_dir().ok()?.join(".claude").join("projects"))
+    Some(claude_config_root().ok()?.join("projects"))
 }
 
 fn claude_scan_cache() -> &'static Mutex<HashMap<PathBuf, ScanFileCache<ClaudeUsageEntry>>> {
@@ -2820,12 +3248,15 @@ fn local_day_key_from_timestamp(timestamp: &str) -> Option<String> {
 }
 
 fn codex_totals_from_value(value: &Value) -> CodexTokenTotals {
+    let cached_input = i64_at(value, &["cached_input_tokens"])
+        .unwrap_or_default()
+        .max(0);
+    let cache_read_input = i64_at(value, &["cache_read_input_tokens"])
+        .unwrap_or_default()
+        .max(0);
     CodexTokenTotals {
         input: i64_at(value, &["input_tokens"]).unwrap_or_default().max(0),
-        cached: i64_at(value, &["cached_input_tokens"])
-            .or_else(|| i64_at(value, &["cache_read_input_tokens"]))
-            .unwrap_or_default()
-            .max(0),
+        cached: cached_input.max(cache_read_input),
         output: i64_at(value, &["output_tokens"]).unwrap_or_default().max(0),
     }
 }
@@ -2840,209 +3271,6 @@ fn i64_at(value: &Value, keys: &[&str]) -> Option<i64> {
         .as_i64()
         .or_else(|| current.as_u64().and_then(|value| i64::try_from(value).ok()))
         .or_else(|| current.as_f64().map(|value| value.round() as i64))
-}
-
-fn read_json_file<T: DeserializeOwned>(path: &Path) -> Option<T> {
-    let contents = fs::read_to_string(path).ok()?;
-    serde_json::from_str::<T>(&contents).ok()
-}
-
-fn merge_codexbar_cost_cache(
-    cache: CodexBarCostCache,
-    since: NaiveDate,
-    until: NaiveDate,
-    days: &mut BTreeMap<String, LocalDayUsage>,
-    models: &mut HashMap<String, LocalModelUsage>,
-) {
-    let mut row_costs: HashMap<(String, String), LocalDayUsage> = HashMap::new();
-    for file in cache.files.values() {
-        for row in &file.codex_rows {
-            if !day_key_in_range(&row.day, since, until) {
-                continue;
-            }
-            let model = normalize_codex_model(&row.model);
-            let cost = codex_cost_usd(&model, row.input, row.cached, row.output);
-            record_local_usage(
-                &mut row_costs,
-                &row.day,
-                &model,
-                row.input.saturating_add(row.output),
-                cost,
-            );
-        }
-    }
-
-    for (day_key, model_values) in cache.days {
-        if !day_key_in_range(&day_key, since, until) {
-            continue;
-        }
-        for (raw_model, packed) in model_values {
-            let model = normalize_codex_model(&raw_model);
-            let input = packed.first().copied().unwrap_or_default();
-            let cached = packed.get(1).copied().unwrap_or_default();
-            let output = packed.get(2).copied().unwrap_or_default();
-            let tokens = input.saturating_add(output).max(0);
-            let row_key = (day_key.clone(), model.clone());
-            let cost = row_costs
-                .get(&row_key)
-                .and_then(|usage| usage.cost_seen.then_some(usage.cost_usd))
-                .or_else(|| codex_cost_usd(&model, input, cached, output));
-
-            record_daily_usage(days, models, &day_key, &model, tokens, cost);
-        }
-    }
-}
-
-// Shared body of the per-provider pi-sessions merges: they differ only in the
-// model normalizer and the pricing fallback used when a row's cached cost is
-// incomplete.
-fn merge_pi_provider_days(
-    provider_days: &HashMap<String, HashMap<String, PiPackedUsage>>,
-    normalize_model: fn(&str) -> String,
-    estimate_cost: fn(&str, &PiPackedUsage) -> Option<f64>,
-    since: NaiveDate,
-    until: NaiveDate,
-    days: &mut BTreeMap<String, LocalDayUsage>,
-    models: &mut HashMap<String, LocalModelUsage>,
-) {
-    for (day_key, model_values) in provider_days {
-        if !day_key_in_range(day_key, since, until) {
-            continue;
-        }
-        for (raw_model, packed) in model_values {
-            let model = normalize_model(raw_model);
-            let derived_tokens = packed
-                .input_tokens
-                .saturating_add(packed.cache_read_tokens)
-                .saturating_add(packed.cache_write_tokens)
-                .saturating_add(packed.output_tokens);
-            let tokens = packed.total_tokens.max(derived_tokens).max(0);
-            let has_complete_cached_cost = packed
-                .usage_sample_count
-                .is_some_and(|count| count > 0 && count == packed.cost_sample_count);
-            let cost = if has_complete_cached_cost {
-                Some(packed.cost_nanos as f64 / 1_000_000_000.0)
-            } else {
-                estimate_cost(&model, packed)
-            };
-
-            record_daily_usage(days, models, day_key, &model, tokens, cost);
-        }
-    }
-}
-
-fn merge_pi_session_cost_cache(
-    cache: PiSessionCostCache,
-    since: NaiveDate,
-    until: NaiveDate,
-    days: &mut BTreeMap<String, LocalDayUsage>,
-    models: &mut HashMap<String, LocalModelUsage>,
-) {
-    let Some(provider_days) = cache.days_by_provider.get("codex") else {
-        return;
-    };
-    merge_pi_provider_days(
-        provider_days,
-        normalize_codex_model,
-        |model, packed| {
-            codex_cost_usd(
-                model,
-                packed
-                    .input_tokens
-                    .saturating_add(packed.cache_read_tokens)
-                    .saturating_add(packed.cache_write_tokens),
-                packed.cache_read_tokens,
-                packed.output_tokens,
-            )
-        },
-        since,
-        until,
-        days,
-        models,
-    );
-}
-
-fn merge_claude_cost_cache(
-    cache: CodexBarCostCache,
-    since: NaiveDate,
-    until: NaiveDate,
-    days: &mut BTreeMap<String, LocalDayUsage>,
-    models: &mut HashMap<String, LocalModelUsage>,
-) {
-    for (day_key, model_values) in cache.days {
-        if !day_key_in_range(&day_key, since, until) {
-            continue;
-        }
-        for (raw_model, packed) in model_values {
-            let model = normalize_claude_model(&raw_model);
-            let input = packed.first().copied().unwrap_or_default();
-            let cache_read = packed.get(1).copied().unwrap_or_default();
-            let cache_create = packed.get(2).copied().unwrap_or_default();
-            let output = packed.get(3).copied().unwrap_or_default();
-            let cached_cost_nanos = packed.get(4).copied().unwrap_or_default();
-            let sample_count = packed.get(5).copied().unwrap_or_default();
-            let priced_sample_count = packed.get(6).copied().unwrap_or_default();
-            let tokens = input
-                .saturating_add(cache_read)
-                .saturating_add(cache_create)
-                .saturating_add(output)
-                .max(0);
-            let has_complete_cached_cost = sample_count > 0 && priced_sample_count == sample_count;
-            let cost = if has_complete_cached_cost {
-                Some(cached_cost_nanos as f64 / 1_000_000_000.0)
-            } else {
-                claude_cost_usd(&model, input, cache_read, cache_create, output)
-            };
-
-            record_daily_usage(days, models, &day_key, &model, tokens, cost);
-        }
-    }
-}
-
-fn merge_pi_claude_cost_cache(
-    cache: PiSessionCostCache,
-    since: NaiveDate,
-    until: NaiveDate,
-    days: &mut BTreeMap<String, LocalDayUsage>,
-    models: &mut HashMap<String, LocalModelUsage>,
-) {
-    let Some(provider_days) = cache.days_by_provider.get("claude") else {
-        return;
-    };
-    merge_pi_provider_days(
-        provider_days,
-        normalize_claude_model,
-        |model, packed| {
-            claude_cost_usd(
-                model,
-                packed.input_tokens,
-                packed.cache_read_tokens,
-                packed.cache_write_tokens,
-                packed.output_tokens,
-            )
-        },
-        since,
-        until,
-        days,
-        models,
-    );
-}
-
-fn record_local_usage(
-    row_costs: &mut HashMap<(String, String), LocalDayUsage>,
-    day_key: &str,
-    model: &str,
-    tokens: i64,
-    cost_usd: Option<f64>,
-) {
-    let usage = row_costs
-        .entry((day_key.to_string(), model.to_string()))
-        .or_default();
-    usage.total_tokens = usage.total_tokens.saturating_add(tokens.max(0));
-    if let Some(cost_usd) = finite_non_negative(cost_usd) {
-        usage.cost_usd += cost_usd;
-        usage.cost_seen = true;
-    }
 }
 
 fn record_daily_usage(
@@ -3106,6 +3334,9 @@ fn normalize_codex_model(raw: &str) -> String {
     if let Some(stripped) = model.strip_prefix("openai/") {
         model = stripped;
     }
+    if model == "gpt-5.6" {
+        return "gpt-5.6-sol".to_string();
+    }
     if codex_model_pricing_exact(model).is_some() {
         return model.to_string();
     }
@@ -3133,13 +3364,15 @@ fn strip_codex_dated_suffix(model: &str) -> Option<&str> {
     matches.then_some(&model[..start])
 }
 
-fn codex_cost_usd(
+fn codex_cost_usd_at_date(
     model: &str,
     input_tokens: i64,
     cached_input_tokens: i64,
     output_tokens: i64,
+    pricing_date: Option<NaiveDate>,
 ) -> Option<f64> {
-    let pricing = codex_model_pricing_exact(&normalize_codex_model(model))?;
+    let normalized = normalize_codex_model(model);
+    let pricing = codex_model_pricing_for_date(&normalized, pricing_date)?;
     let input_tokens = input_tokens.max(0);
     let cached = cached_input_tokens.max(0).min(input_tokens);
     let non_cached = input_tokens.saturating_sub(cached);
@@ -3173,6 +3406,37 @@ fn codex_cost_usd(
             + cached as f64 * cached_input_rate
             + output_tokens as f64 * output_rate,
     )
+}
+
+fn codex_model_pricing_for_date(
+    model: &str,
+    pricing_date: Option<NaiveDate>,
+) -> Option<CodexModelPricing> {
+    let cutoff = NaiveDate::from_ymd_opt(2026, 7, 30).expect("valid GPT-5.6 cutoff date");
+    if pricing_date.is_some_and(|date| date < cutoff) {
+        return match model {
+            "gpt-5.6-terra" => Some(CodexModelPricing {
+                input_rate: 2.5e-6,
+                output_rate: 1.5e-5,
+                cache_rate: Some(2.5e-7),
+                threshold_tokens: Some(272_000),
+                input_rate_above_threshold: Some(5e-6),
+                output_rate_above_threshold: Some(2.25e-5),
+                cache_rate_above_threshold: Some(5e-7),
+            }),
+            "gpt-5.6-luna" => Some(CodexModelPricing {
+                input_rate: 1e-6,
+                output_rate: 6e-6,
+                cache_rate: Some(1e-7),
+                threshold_tokens: Some(272_000),
+                input_rate_above_threshold: Some(2e-6),
+                output_rate_above_threshold: Some(9e-6),
+                cache_rate_above_threshold: Some(2e-7),
+            }),
+            _ => codex_model_pricing_exact(model),
+        };
+    }
+    codex_model_pricing_exact(model)
 }
 
 fn codex_model_pricing_exact(model: &str) -> Option<CodexModelPricing> {
@@ -3286,6 +3550,33 @@ fn codex_model_pricing_exact(model: &str) -> Option<CodexModelPricing> {
             input_rate_above_threshold: Some(1e-5),
             output_rate_above_threshold: Some(4.5e-5),
             cache_rate_above_threshold: Some(1e-6),
+        },
+        "gpt-5.6-sol" => CodexModelPricing {
+            input_rate: 5e-6,
+            output_rate: 3e-5,
+            cache_rate: Some(5e-7),
+            threshold_tokens: Some(272_000),
+            input_rate_above_threshold: Some(1e-5),
+            output_rate_above_threshold: Some(4.5e-5),
+            cache_rate_above_threshold: Some(1e-6),
+        },
+        "gpt-5.6-terra" => CodexModelPricing {
+            input_rate: 2e-6,
+            output_rate: 1.2e-5,
+            cache_rate: Some(2e-7),
+            threshold_tokens: Some(272_000),
+            input_rate_above_threshold: Some(4e-6),
+            output_rate_above_threshold: Some(1.8e-5),
+            cache_rate_above_threshold: Some(4e-7),
+        },
+        "gpt-5.6-luna" => CodexModelPricing {
+            input_rate: 2e-7,
+            output_rate: 1.2e-6,
+            cache_rate: Some(2e-8),
+            threshold_tokens: Some(272_000),
+            input_rate_above_threshold: Some(4e-7),
+            output_rate_above_threshold: Some(1.8e-6),
+            cache_rate_above_threshold: Some(4e-8),
         },
         _ => return None,
     };
@@ -3430,20 +3721,30 @@ fn claude_model_pricing_exact(model: &str) -> Option<ClaudeModelPricing> {
             cache_creation_rate_above_threshold: None,
             cache_read_rate_above_threshold: None,
         },
-        "claude-sonnet-4-5"
-        | "claude-sonnet-4-6"
-        | "claude-sonnet-4-5-20250929"
-        | "claude-sonnet-4-20250514" => ClaudeModelPricing {
+        "claude-sonnet-4-6" => ClaudeModelPricing {
             input_rate: 3e-6,
             output_rate: 1.5e-5,
             cache_creation_rate: 3.75e-6,
             cache_read_rate: 3e-7,
-            threshold_tokens: Some(200_000),
-            input_rate_above_threshold: Some(6e-6),
-            output_rate_above_threshold: Some(2.25e-5),
-            cache_creation_rate_above_threshold: Some(7.5e-6),
-            cache_read_rate_above_threshold: Some(6e-7),
+            threshold_tokens: None,
+            input_rate_above_threshold: None,
+            output_rate_above_threshold: None,
+            cache_creation_rate_above_threshold: None,
+            cache_read_rate_above_threshold: None,
         },
+        "claude-sonnet-4-5" | "claude-sonnet-4-5-20250929" | "claude-sonnet-4-20250514" => {
+            ClaudeModelPricing {
+                input_rate: 3e-6,
+                output_rate: 1.5e-5,
+                cache_creation_rate: 3.75e-6,
+                cache_read_rate: 3e-7,
+                threshold_tokens: Some(200_000),
+                input_rate_above_threshold: Some(6e-6),
+                output_rate_above_threshold: Some(2.25e-5),
+                cache_creation_rate_above_threshold: Some(7.5e-6),
+                cache_read_rate_above_threshold: Some(6e-7),
+            }
+        }
         "claude-opus-4-20250514" | "claude-opus-4-1" => ClaudeModelPricing {
             input_rate: 1.5e-5,
             output_rate: 7.5e-5,
@@ -3468,9 +3769,13 @@ fn codex_plan_display_text(raw: &str) -> Option<String> {
     let display = match normalized.as_str() {
         "free" => "Free".to_string(),
         "plus" => "Plus".to_string(),
+        "go" => "Go".to_string(),
         "prolite" => "Pro 5x".to_string(),
         "pro" => "Pro 20x".to_string(),
         "team" => "Team".to_string(),
+        "business" => "Business".to_string(),
+        "free_workspace" => "Free workspace".to_string(),
+        "education" | "edu" => "Education".to_string(),
         "enterprise" => "Enterprise".to_string(),
         _ => raw
             .split(|character: char| {
@@ -3563,6 +3868,7 @@ fn codex_window_role(window: &RateWindowDetail) -> &'static str {
     match window.window_minutes.map(|value| value.round() as i64) {
         Some(300) => "session",
         Some(10080) => "weekly",
+        Some(43200) => "monthly",
         _ => "unknown",
     }
 }
@@ -3570,6 +3876,7 @@ fn codex_window_role(window: &RateWindowDetail) -> &'static str {
 async fn fetch_claude_provider(
     client: &reqwest::Client,
     keychain_access: KeychainAccess,
+    force_local_scan: bool,
 ) -> Result<ProviderUsage, UsageFetchError> {
     // The Keychain path can wait up to 10s on a user prompt; keep that off
     // the async runtime's worker threads.
@@ -3588,6 +3895,10 @@ async fn fetch_claude_provider(
     }
 
     let usage = fetch_claude_usage(client, &credentials).await?;
+    let account_email = fetch_claude_profile_email(client, &credentials)
+        .await
+        .ok()
+        .flatten();
     let plan_text = claude_plan_display_text(
         credentials.subscription_type.as_deref(),
         credentials.rate_limit_tier.as_deref(),
@@ -3595,12 +3906,15 @@ async fn fetch_claude_provider(
     .or_else(|| Some("Pro".to_string()));
     // Reading Claude's local session logs walks the filesystem and parses JSONL;
     // keep that off the async runtime's worker threads (like the Keychain read
-    // above). On Linux this fallback runs on every refresh.
-    let local_usage = tauri::async_runtime::spawn_blocking(load_claude_local_token_usage)
-        .await
-        .map_err(|error| UsageFetchError::Message(error.to_string()))?;
+    // above). Automatic local-history scans have a 15-minute energy floor.
+    let local_usage = tauri::async_runtime::spawn_blocking(move || {
+        cached_claude_local_token_usage(force_local_scan)
+    })
+    .await
+    .map_err(|error| UsageFetchError::Message(error.to_string()))?;
     Ok(claude_provider_from_usage_with_local_usage(
         usage,
+        account_email,
         plan_text,
         local_usage,
     ))
@@ -3621,7 +3935,7 @@ fn load_claude_credentials(keychain_access: KeychainAccess) -> Result<ClaudeCred
         }
     }
 
-    let path = home_dir()?.join(".claude").join(".credentials.json");
+    let path = claude_credentials_path()?;
     match fs::read_to_string(&path) {
         Ok(contents) => {
             let mut credentials = parse_claude_credentials(&contents)?;
@@ -3637,6 +3951,34 @@ fn load_claude_credentials(keychain_access: KeychainAccess) -> Result<ClaudeCred
             Err("Claude OAuth credentials not found. Run `claude` to authenticate.".to_string())
         }
         Err(error) => Err(error.to_string()),
+    }
+}
+
+fn claude_config_root() -> Result<PathBuf, String> {
+    if let Some(configured) = env::var_os("CLAUDE_CONFIG_DIR") {
+        if !configured.is_empty() {
+            return resolve_literal_config_path(PathBuf::from(configured));
+        }
+    }
+    Ok(home_dir()?.join(".claude"))
+}
+
+fn claude_credentials_path() -> Result<PathBuf, String> {
+    let root = match env::var_os("CLAUDE_SECURESTORAGE_CONFIG_DIR") {
+        Some(value) if !value.is_empty() => resolve_literal_config_path(PathBuf::from(value))?,
+        Some(_) => home_dir()?.join(".claude"),
+        None => claude_config_root()?,
+    };
+    Ok(root.join(".credentials.json"))
+}
+
+fn resolve_literal_config_path(path: PathBuf) -> Result<PathBuf, String> {
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(env::current_dir()
+            .map_err(|error| error.to_string())?
+            .join(path))
     }
 }
 
@@ -3708,13 +4050,46 @@ async fn fetch_claude_usage(
         .map_err(|error| UsageFetchError::Message(error.to_string()))
 }
 
+async fn fetch_claude_profile_email(
+    client: &reqwest::Client,
+    credentials: &ClaudeCredentials,
+) -> Result<Option<String>, UsageFetchError> {
+    let response = client
+        .get(CLAUDE_OAUTH_PROFILE_URL)
+        .bearer_auth(&credentials.access_token)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .send()
+        .await
+        .map_err(|error| UsageFetchError::Message(error.to_string()))?;
+    if !response.status().is_success() {
+        return Ok(None);
+    }
+    let value = response
+        .json::<Value>()
+        .await
+        .map_err(|error| UsageFetchError::Message(error.to_string()))?;
+    let email = value
+        .get("account")
+        .and_then(|account| {
+            string_at(account, &["emailAddress"])
+                .or_else(|| string_at(account, &["email_address"]))
+                .or_else(|| string_at(account, &["email"]))
+        })
+        .or_else(|| string_at(&value, &["emailAddress"]))
+        .or_else(|| string_at(&value, &["email_address"]))
+        .or_else(|| string_at(&value, &["email"]));
+    Ok(non_empty_owned(email))
+}
+
 #[cfg(test)]
 fn claude_provider_from_usage(response: ClaudeOAuthUsageResponse) -> ProviderUsage {
-    claude_provider_from_usage_with_local_usage(response, Some("Pro".to_string()), None)
+    claude_provider_from_usage_with_local_usage(response, None, Some("Pro".to_string()), None)
 }
 
 fn claude_provider_from_usage_with_local_usage(
     response: ClaudeOAuthUsageResponse,
+    account_email: Option<String>,
     plan_text: Option<String>,
     local_usage: Option<(Option<TokenUsageSummary>, Vec<DailyUsagePoint>)>,
 ) -> ProviderUsage {
@@ -3768,9 +4143,10 @@ fn claude_provider_from_usage_with_local_usage(
     if let Some((title, window)) = tertiary.as_ref() {
         usage_rows.push(usage_row_from_window("tertiary", title, window));
     }
+    usage_rows.extend(claude_scoped_weekly_usage_rows(&response.limits));
     if let Some(window) = response
         .routines_window()
-        .and_then(|window| rate_window_from_optional_claude(window, Some(CLAUDE_WEEK_MINUTES)))
+        .and_then(|window| rate_window_from_claude(window, Some(CLAUDE_WEEK_MINUTES)))
     {
         usage_rows.push(usage_row_from_window(
             "claude-routines",
@@ -3778,7 +4154,6 @@ fn claude_provider_from_usage_with_local_usage(
             &window,
         ));
     }
-    usage_rows.extend(claude_scoped_weekly_usage_rows(&response.limits));
     if let Some(window) = response.extra_usage.as_ref().and_then(extra_usage_window) {
         usage_rows.push(usage_row_from_window("extra-usage", "Extra usage", &window));
     }
@@ -3790,7 +4165,7 @@ fn claude_provider_from_usage_with_local_usage(
 
     ProviderUsage {
         name: "Claude".to_string(),
-        account_email: None,
+        account_email,
         plan_text,
         session_left_percent: primary.as_ref().and_then(|window| window.percent_left),
         weekly_left_percent: secondary.as_ref().and_then(|window| window.percent_left),
@@ -3861,6 +4236,12 @@ fn non_empty_trimmed(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
 
+fn non_empty_owned(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 fn claude_limit_slug(value: &str) -> String {
     let mut slug = String::new();
     let mut last_was_dash = false;
@@ -3890,21 +4271,6 @@ fn rate_window_from_claude(
         window_minutes,
         reset_at,
     ))
-}
-
-fn rate_window_from_optional_claude(
-    window: &OptionalClaudeOAuthWindow,
-    window_minutes: Option<f64>,
-) -> Option<RateWindowDetail> {
-    if let Some(value) = window.as_ref() {
-        if let Some(detail) = rate_window_from_claude(value, window_minutes) {
-            return Some(detail);
-        }
-    }
-
-    window
-        .present
-        .then(|| rate_window_detail_from_parts(0.0, window_minutes, None))
 }
 
 fn extra_usage_window(extra: &ClaudeExtraUsage) -> Option<RateWindowDetail> {
@@ -4035,12 +4401,6 @@ fn string_at(value: &Value, keys: &[&str]) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
-}
-
-fn set_string(value: &mut Value, key: &str, next: Option<String>) {
-    if let Some(next) = next.filter(|value| !value.is_empty()) {
-        value[key] = Value::String(next);
-    }
 }
 
 #[cfg(target_os = "macos")]
@@ -4757,6 +5117,17 @@ mod tests {
                 && row.title == "Daily Routines"
                 && row.percent_left == Some(100.0)
         }));
+        let scoped_index = provider
+            .usage_rows
+            .iter()
+            .position(|row| row.id == "claude-weekly-scoped-fable")
+            .unwrap();
+        let routines_index = provider
+            .usage_rows
+            .iter()
+            .position(|row| row.id == "claude-routines")
+            .unwrap();
+        assert!(scoped_index < routines_index);
         assert!(provider.usage_rows.iter().any(|row| {
             row.id == "extra-usage"
                 && row.percent_left == Some(96.0)
@@ -4784,7 +5155,7 @@ mod tests {
     }
 
     #[test]
-    fn ignores_legacy_design_window_and_keeps_null_routines_lane() {
+    fn ignores_legacy_design_window_and_null_routines_lane() {
         let json = r#"{
           "five_hour": { "utilization": 9, "resets_at": "2100-01-01T00:00:00Z" },
           "seven_day_omelette": null,
@@ -4797,11 +5168,10 @@ mod tests {
             .usage_rows
             .iter()
             .any(|row| row.id == "claude-design"));
-        assert!(provider.usage_rows.iter().any(|row| {
-            row.id == "claude-routines"
-                && row.title == "Daily Routines"
-                && row.percent_left == Some(100.0)
-        }));
+        assert!(!provider
+            .usage_rows
+            .iter()
+            .any(|row| row.id == "claude-routines"));
     }
 
     #[test]
@@ -5044,6 +5414,137 @@ mod tests {
     fn widget_settings_deserialize_defaults_missing_scale() {
         let settings: WidgetSettings = serde_json::from_str("{}").unwrap();
         assert_eq!(settings.scale, DEFAULT_SCALE);
+        assert_eq!(settings.low_power_mode, LowPowerMode::Off);
+        assert!(!settings.hide_claude_routines);
+    }
+
+    #[test]
+    fn codex_pat_is_preferred_without_treating_oauth_as_pat() {
+        let value = json!({
+            "personal_access_token": " at-test ",
+            "tokens": { "access_token": "oauth-test", "account_id": "acct-oauth" }
+        });
+        let credentials = parse_codex_credentials_value(&value).unwrap();
+        assert_eq!(credentials.access_token, "at-test");
+        assert!(credentials.is_personal_access_token);
+        assert!(credentials.account_id.is_none());
+
+        let oauth = parse_codex_credentials_value(&json!({
+            "tokens": { "access_token": "oauth-test", "account_id": "acct-oauth" }
+        }))
+        .unwrap();
+        assert!(!oauth.is_personal_access_token);
+        assert_eq!(oauth.account_id.as_deref(), Some("acct-oauth"));
+    }
+
+    #[test]
+    fn codex_parser_handles_cache_aliases_stale_totals_and_bare_usage() {
+        let mut state = CodexLineParserState::default();
+        let turn = json!({
+            "type": "turn_context",
+            "timestamp": "2026-08-21T12:00:00Z",
+            "payload": { "model": "openai/gpt-5.6" }
+        })
+        .to_string();
+        assert!(parse_codex_session_line(&turn, &mut state).is_none());
+
+        let event = |timestamp: &str, input: i64, output: i64, cache_read: i64| {
+            json!({
+                "type": "event_msg",
+                "timestamp": timestamp,
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": input,
+                            "cached_input_tokens": 0,
+                            "cache_read_input_tokens": cache_read,
+                            "output_tokens": output
+                        },
+                        "last_token_usage": {
+                            "input_tokens": 5,
+                            "cached_input_tokens": 0,
+                            "cache_read_input_tokens": cache_read,
+                            "output_tokens": 1
+                        }
+                    }
+                }
+            })
+            .to_string()
+        };
+        let first = parse_codex_session_line(&event("2026-08-21T12:00:01Z", 10, 3, 2), &mut state)
+            .expect("first delta");
+        assert_eq!(first.model, "gpt-5.6-sol");
+        assert_eq!(first.tokens, 6);
+        assert!(
+            parse_codex_session_line(&event("2026-08-21T12:00:02Z", 8, 2, 1), &mut state).is_none()
+        );
+        let resumed =
+            parse_codex_session_line(&event("2026-08-21T12:00:03Z", 15, 5, 2), &mut state)
+                .expect("resumed delta");
+        assert_eq!(resumed.tokens, 6);
+
+        let bare = json!({
+            "result": { "usage": { "prompt_tokens": 120, "completion_tokens": 30, "cached_tokens": 20 } },
+            "model": "openai/gpt-5.6-terra"
+        })
+        .to_string();
+        let bare = parse_codex_session_line(&bare, &mut state).expect("timestamp fallback");
+        assert_eq!(bare.tokens, 150);
+        assert_eq!(bare.model, "gpt-5.6-terra");
+    }
+
+    #[test]
+    fn maps_codex_monthly_credit_and_spark_windows() {
+        let response: CodexUsageApiResponse = serde_json::from_str(r#"{
+          "plan_type": "business",
+          "spend_control": { "individual_limit": { "limit": "100", "used": 27 } },
+          "additional_rate_limits": [{
+            "limit_name": "GPT-5.3-Codex-Spark",
+            "metered_feature": "gpt_5_3_codex_spark",
+            "rate_limit": {
+              "primary_window": { "used_percent": "10", "reset_at": 4102444800, "limit_window_seconds": 18000 },
+              "secondary_window": { "used_percent": 20, "reset_at": 4103049600, "limit_window_seconds": 604800 }
+            }
+          }]
+        }"#)
+        .unwrap();
+        let provider = codex_provider_from_usage_with_local_usage(response, None);
+        assert_eq!(provider.plan_text.as_deref(), Some("Business"));
+        assert_eq!(
+            provider
+                .tertiary
+                .as_ref()
+                .and_then(|window| window.percent_left),
+            Some(73.0)
+        );
+        assert!(provider
+            .usage_rows
+            .iter()
+            .any(|row| row.id == "monthly-credit"));
+        assert!(provider
+            .usage_rows
+            .iter()
+            .any(|row| row.id == "codex-spark"));
+        assert!(provider
+            .usage_rows
+            .iter()
+            .any(|row| row.id == "codex-spark-weekly"));
+    }
+
+    #[test]
+    fn prices_gpt_56_history_and_sonnet_46_without_long_context_multiplier() {
+        assert_eq!(normalize_codex_model("gpt-5.6"), "gpt-5.6-sol");
+        let before = NaiveDate::from_ymd_opt(2026, 7, 29).unwrap();
+        let after = NaiveDate::from_ymd_opt(2026, 7, 30).unwrap();
+        let historical =
+            codex_cost_usd_at_date("gpt-5.6-terra", 1_000_000, 0, 0, Some(before)).unwrap();
+        let current =
+            codex_cost_usd_at_date("gpt-5.6-terra", 1_000_000, 0, 0, Some(after)).unwrap();
+        assert!(historical > current);
+
+        let sonnet = claude_model_pricing_exact("claude-sonnet-4-6").unwrap();
+        assert_eq!(sonnet.threshold_tokens, None);
     }
 
     // tokens are [input, cache_read, cache_creation, output].

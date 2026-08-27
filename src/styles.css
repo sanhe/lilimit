@@ -360,6 +360,10 @@ h2 {
   gap: 4px;
 }
 
+.segmented.three {
+  grid-template-columns: repeat(3, 1fr);
+}
+
 .segmented button {
   min-width: 0;
   height: 24px;

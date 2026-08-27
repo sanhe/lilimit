@@ -8,6 +8,7 @@ type UsageSource = "lilimitCollected";
 type DisplayMode = "simple" | "full";
 type WidgetBackground = "dark" | "light";
 type KeychainAccess = "off" | "allow";
+type LowPowerMode = "off" | "on" | "automatic";
 type ToolbarDisplay = "text" | "bars";
 type FullTab = "overview" | "codex" | "claude";
 type ProviderName = "Codex" | "Claude";
@@ -21,6 +22,8 @@ type WidgetSettings = {
   displayMode: DisplayMode;
   background: WidgetBackground;
   keychainAccess: KeychainAccess;
+  lowPowerMode: LowPowerMode;
+  hideClaudeRoutines: boolean;
   toolbarDisplay: ToolbarDisplay;
   scale: number;
   windowPosition: WindowPosition | null;
@@ -127,6 +130,8 @@ const DEFAULT_SETTINGS: WidgetSettings = {
   displayMode: "simple",
   background: "dark",
   keychainAccess: "off",
+  lowPowerMode: "off",
+  hideClaudeRoutines: false,
   toolbarDisplay: "bars",
   scale: DEFAULT_SCALE,
   windowPosition: null,
@@ -453,6 +458,11 @@ function normalizeSettings(settings: Partial<WidgetSettings> | null): WidgetSett
     displayMode: settings?.displayMode === "full" ? "full" : "simple",
     background: settings?.background === "light" ? "light" : "dark",
     keychainAccess: settings?.keychainAccess === "allow" ? "allow" : "off",
+    lowPowerMode:
+      settings?.lowPowerMode === "on" || settings?.lowPowerMode === "automatic"
+        ? settings.lowPowerMode
+        : "off",
+    hideClaudeRoutines: settings?.hideClaudeRoutines === true,
     toolbarDisplay: settings?.toolbarDisplay === "text" ? "text" : "bars",
     scale: clampScale(settings?.scale),
     windowPosition: settings?.windowPosition ?? null,
@@ -488,7 +498,10 @@ function fallbackRows(provider: ProviderUsage): UsageRow[] {
 }
 
 function providerUsageRows(provider: ProviderUsage): UsageRow[] {
-  return provider.usageRows.length > 0 ? provider.usageRows : fallbackRows(provider);
+  const rows = provider.usageRows.length > 0 ? provider.usageRows : fallbackRows(provider);
+  return provider.name === "Claude" && currentSettings.hideClaudeRoutines
+    ? rows.filter((row) => row.id !== "claude-routines")
+    : rows;
 }
 
 function authStatusFor(provider: ProviderName): ProviderAuthStatus | null {
@@ -558,6 +571,8 @@ function renderSettingsPanel(): string {
   const mode = currentSettings.displayMode;
   const background = currentSettings.background;
   const keychainAccess = currentSettings.keychainAccess;
+  const lowPowerMode = currentSettings.lowPowerMode;
+  const routinesVisible = !currentSettings.hideClaudeRoutines;
   const toolbarDisplay = currentSettings.toolbarDisplay;
   const scale = clampScale(currentSettings.scale);
   const atMin = scale <= MIN_SCALE + 1e-6;
@@ -593,6 +608,21 @@ function renderSettingsPanel(): string {
         <div class="segmented">
           <button type="button" data-keychain="off" class="${keychainAccess === "off" ? "active" : ""}">Off</button>
           <button type="button" data-keychain="allow" class="${keychainAccess === "allow" ? "active" : ""}">Allow</button>
+        </div>
+      </div>
+      <div class="setting-group">
+        <span>Low power</span>
+        <div class="segmented three">
+          <button type="button" data-low-power="off" class="${lowPowerMode === "off" ? "active" : ""}">Off</button>
+          <button type="button" data-low-power="on" class="${lowPowerMode === "on" ? "active" : ""}">On</button>
+          <button type="button" data-low-power="automatic" class="${lowPowerMode === "automatic" ? "active" : ""}">Auto</button>
+        </div>
+      </div>
+      <div class="setting-group">
+        <span>Daily Routines</span>
+        <div class="segmented">
+          <button type="button" data-routines-visible="true" class="${routinesVisible ? "active" : ""}">Show</button>
+          <button type="button" data-routines-visible="false" class="${!routinesVisible ? "active" : ""}">Hide</button>
         </div>
       </div>
       <div class="setting-group">
@@ -1412,6 +1442,21 @@ function bindInteractions(): void {
     button.addEventListener("click", () => {
       const keychainAccess: KeychainAccess = button.dataset.keychain === "allow" ? "allow" : "off";
       void saveSettings({ keychainAccess });
+    });
+  });
+
+  appRoot.querySelectorAll<HTMLButtonElement>("[data-low-power]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const value = button.dataset.lowPower;
+      const lowPowerMode: LowPowerMode =
+        value === "on" || value === "automatic" ? value : "off";
+      void saveSettings({ lowPowerMode });
+    });
+  });
+
+  appRoot.querySelectorAll<HTMLButtonElement>("[data-routines-visible]").forEach((button) => {
+    button.addEventListener("click", () => {
+      void saveSettings({ hideClaudeRoutines: button.dataset.routinesVisible !== "true" });
     });
   });
 
