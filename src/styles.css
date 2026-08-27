@@ -234,14 +234,39 @@ h2 {
 }
 
 .settings-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
   min-width: 0;
   padding-bottom: 10px;
   border: 1px solid var(--line);
   border-width: 0 0 1px;
 }
 
+.settings-title-copy {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
 .settings-header h1 {
   font-size: 15px;
+}
+
+.settings-version {
+  color: var(--subtle);
+  font-size: 9.5px;
+}
+
+.settings-close-button {
+  flex: 0 0 auto;
+  margin-top: -2px;
+}
+
+.settings-close-button:hover {
+  background: #ef6f6c;
+  color: #ffffff;
 }
 
 .accounts-section {

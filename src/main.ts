@@ -1,7 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getVersion } from "@tauri-apps/api/app";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import "./styles.css";
+import { renderSettingsHeader } from "./settings-view";
 
 type UsageStatus = "ready" | "missing" | "invalidJson" | "ioError";
 type UsageSource = "lilimitCollected";
@@ -149,6 +151,7 @@ const appRoot = app;
 let currentSettings: WidgetSettings = DEFAULT_SETTINGS;
 let latestSnapshot: UsageSnapshot | null = null;
 let settingsError: string | null = null;
+let appVersion = "unknown";
 let collectionError: string | null = null;
 let refreshInProgress = false;
 let authStatuses: ProviderAuthStatus[] = [];
@@ -641,9 +644,7 @@ function renderSettingsPanel(): string {
 function renderSettingsWindow(): void {
   appRoot.innerHTML = `
     <main class="surface settings-view ${currentSettings.background}-bg">
-      <header class="settings-header">
-        <h1>lilimit settings</h1>
-      </header>
+      ${renderSettingsHeader(appVersion)}
       ${renderSettingsPanel()}
       <button class="settings-action close-settings-button" type="button">Done</button>
     </main>
@@ -1513,8 +1514,10 @@ function bindInteractions(): void {
     void refreshCollectedFromSettings();
   });
 
-  appRoot.querySelector(".close-settings-button")?.addEventListener("click", () => {
-    hideSettingsWindow();
+  appRoot.querySelectorAll(".close-settings-button").forEach((button) => {
+    button.addEventListener("click", () => {
+      hideSettingsWindow();
+    });
   });
 
   if (!isSettingsWindow) {
@@ -1683,6 +1686,11 @@ async function initialize(): Promise<void> {
   }
 
   if (isSettingsWindow) {
+    try {
+      appVersion = await getVersion();
+    } catch {
+      // Keep the settings window usable if application metadata is unavailable.
+    }
     bindSettingsWindowShortcuts();
     renderSettingsWindow();
     void loadProviderAuthStatuses();

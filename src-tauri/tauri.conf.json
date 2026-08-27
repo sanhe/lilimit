@@ -27,7 +27,7 @@
         "title": "lilimit settings",
         "width": 320,
         "height": 620,
-        "decorations": true,
+        "decorations": false,
         "resizable": false,
         "alwaysOnTop": true,
         "transparent": false,
