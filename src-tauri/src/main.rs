@@ -1368,7 +1368,7 @@ struct CodexUsageApiResponse {
     #[serde(default, alias = "spendControl")]
     spend_control: Option<CodexSpendControlDetails>,
     #[serde(default)]
-    additional_rate_limits: Vec<CodexAdditionalRateLimit>,
+    additional_rate_limits: Option<Vec<CodexAdditionalRateLimit>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2311,7 +2311,10 @@ fn codex_provider_from_usage_with_local_usage(
         ));
     }
     usage_rows.extend(codex_additional_usage_rows(
-        &response.additional_rate_limits,
+        response
+            .additional_rate_limits
+            .as_deref()
+            .unwrap_or_default(),
     ));
 
     let reset_text = primary
@@ -5530,6 +5533,37 @@ mod tests {
             .usage_rows
             .iter()
             .any(|row| row.id == "codex-spark-weekly"));
+    }
+
+    #[test]
+    fn maps_codex_weekly_usage_with_null_or_absent_additional_limits() {
+        for additional_limits in [None, Some(Value::Null), Some(json!([]))] {
+            let mut payload = json!({
+                "plan_type": "prolite",
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 50,
+                        "limit_window_seconds": 604800,
+                        "reset_at": 4103049600i64
+                    },
+                    "secondary_window": null
+                },
+                "credits": { "balance": "0" },
+                "spend_control": { "individual_limit": null }
+            });
+            if let Some(limits) = additional_limits {
+                payload["additional_rate_limits"] = limits;
+            }
+            let response: CodexUsageApiResponse = serde_json::from_value(payload).unwrap();
+            let provider = codex_provider_from_usage_with_local_usage(response, None);
+
+            assert_eq!(provider.usage_rows.len(), 1);
+            assert_eq!(provider.usage_rows[0].id, "weekly");
+            assert_eq!(provider.usage_rows[0].title, "Weekly");
+            assert_eq!(provider.usage_rows[0].percent_left, Some(50.0));
+            assert!(!provider.stale);
+            assert!(provider.error.is_none());
+        }
     }
 
     #[test]
