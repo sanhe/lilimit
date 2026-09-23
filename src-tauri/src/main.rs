@@ -2964,11 +2964,10 @@ fn parse_codex_session_line(
         };
         state.previous_total = Some(total);
         delta
-    } else if let Some(last) = last {
+    } else {
+        let last = last?;
         state.previous_total = Some(state.previous_total.unwrap_or_default().add(last));
         last
-    } else {
-        return None;
     };
     if state.current_model.is_empty() || delta.total_tokens() <= 0 {
         return None;
@@ -4651,7 +4650,7 @@ fn tray_usage_title(providers: &[ProviderUsage]) -> Option<String> {
             let used_percent = provider_tray_used_percent(provider)?;
             Some(format!(
                 "{} {}%",
-                tray_provider_label(&provider.name),
+                provider.name,
                 used_percent.round() as i64
             ))
         })
@@ -4667,14 +4666,6 @@ fn provider_tray_used_percent(provider: &ProviderUsage) -> Option<f64> {
         .and_then(|window| window.used_percent)
         .or_else(|| provider.session_left_percent.map(|left| 100.0 - left))
         .map(clamp_percent)
-}
-
-fn tray_provider_label(name: &str) -> &str {
-    match name {
-        "Codex" => "Codex",
-        "Claude" => "Claude",
-        _ => name,
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
