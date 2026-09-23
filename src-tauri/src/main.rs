@@ -42,6 +42,7 @@ const MAX_SCALE: f64 = 2.0;
 const DEFAULT_SCALE: f64 = 1.0;
 const COLLECTION_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const LOW_POWER_REFRESH_INTERVAL: Duration = Duration::from_secs(30 * 60);
+static INITIAL_COLLECTION: AtomicBool = AtomicBool::new(true);
 // The widget polls at the same 5-minute period, but updatedAt is stamped when
 // a collection *finishes*, so each tick would find a snapshot a few seconds
 // younger than the full window and skip every other collection (an effective
@@ -1573,6 +1574,7 @@ async fn collect_usage_snapshot(
     force: Option<bool>,
     bypass_claude_backoff: bool,
 ) -> Result<UsageSnapshotResponse, String> {
+    let retry_failed_snapshot = INITIAL_COLLECTION.swap(false, Ordering::AcqRel);
     let force = force.unwrap_or(false);
     let settings = read_widget_settings().unwrap_or_default();
     let previous_snapshot = read_collected_usage_snapshot_file().unwrap_or(None);
@@ -1586,6 +1588,7 @@ async fn collect_usage_snapshot(
             if snapshot_is_fresh(
                 snapshot,
                 refresh_interval.saturating_sub(COLLECTION_FRESHNESS_TOLERANCE),
+                retry_failed_snapshot,
             ) {
                 let response = response_from_snapshot_file(snapshot)?;
                 sync_tray_title_from_response(&app, &response);
@@ -1791,8 +1794,17 @@ fn response_from_snapshot_file(
     ))
 }
 
-fn snapshot_is_fresh(snapshot: &UsageSnapshotFile, interval: Duration) -> bool {
+fn snapshot_is_fresh(
+    snapshot: &UsageSnapshotFile,
+    interval: Duration,
+    retry_failed_snapshot: bool,
+) -> bool {
     timestamp_is_within(&snapshot.updated_at, interval)
+        && (!retry_failed_snapshot
+            || snapshot
+                .providers
+                .iter()
+                .all(|provider| !provider.stale && provider.error.is_none()))
 }
 
 fn timestamp_is_within(value: &str, interval: Duration) -> bool {
@@ -4942,6 +4954,46 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recent_snapshot_with_failed_provider_is_retried() {
+        let mut snapshot: UsageSnapshotFile = serde_json::from_value(json!({
+            "updatedAt": Utc::now().to_rfc3339(),
+            "providers": [{ "name": "Codex", "stale": false, "error": null }]
+        }))
+        .unwrap();
+
+        assert!(snapshot_is_fresh(
+            &snapshot,
+            COLLECTION_REFRESH_INTERVAL,
+            true
+        ));
+
+        snapshot.providers[0].stale = true;
+        assert!(!snapshot_is_fresh(
+            &snapshot,
+            COLLECTION_REFRESH_INTERVAL,
+            true
+        ));
+        assert!(snapshot_is_fresh(
+            &snapshot,
+            COLLECTION_REFRESH_INTERVAL,
+            false
+        ));
+
+        snapshot.providers[0].stale = false;
+        snapshot.providers[0].error = Some("error decoding response body".to_string());
+        assert!(!snapshot_is_fresh(
+            &snapshot,
+            COLLECTION_REFRESH_INTERVAL,
+            true
+        ));
+        assert!(snapshot_is_fresh(
+            &snapshot,
+            COLLECTION_REFRESH_INTERVAL,
+            false
+        ));
+    }
 
     #[test]
     fn uses_official_subscription_login_commands() {
