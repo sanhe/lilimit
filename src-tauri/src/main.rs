@@ -58,6 +58,8 @@ const CLAUDE_RATE_LIMIT_MAX_BACKOFF: Duration = Duration::from_secs(6 * 60 * 60)
 const CLAUDE_WEEK_MINUTES: f64 = 7.0 * 24.0 * 60.0;
 const CLI_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 const CLI_LOGIN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+#[cfg(target_os = "linux")]
+const LINUX_BUNDLED_CODEX_CLI: &str = "/usr/lib/chatgpt/resources/codex";
 const CODEX_DEFAULT_CHATGPT_BASE_URL: &str = "https://chatgpt.com/backend-api";
 const CODEX_PAT_WHOAMI_URL: &str =
     "https://auth.openai.com/api/accounts/v1/user-auth-credential/whoami";
@@ -506,6 +508,12 @@ fn read_collected_usage_snapshot_file() -> Result<Option<UsageSnapshotFile>, Str
 }
 
 fn resolve_cli_binary(provider: LoginProvider) -> Option<PathBuf> {
+    cli_binary_candidates(provider)
+        .into_iter()
+        .find(|path| path.is_file())
+}
+
+fn cli_binary_candidates(provider: LoginProvider) -> Vec<PathBuf> {
     let executable = provider.executable();
     let mut candidates = env::var_os("PATH")
         .map(|path| {
@@ -527,8 +535,15 @@ fn resolve_cli_binary(provider: LoginProvider) -> Option<PathBuf> {
             home.join(".npm-global").join("bin").join(executable),
         ]);
     }
+    // Desktop sessions often lack the Node version-manager directory that
+    // holds `codex`, but the ChatGPT desktop app ships a native Codex CLI that
+    // supports `codex login`. Keep it last so user installs take priority.
+    #[cfg(target_os = "linux")]
+    if provider == LoginProvider::Codex {
+        candidates.push(PathBuf::from(LINUX_BUNDLED_CODEX_CLI));
+    }
 
-    candidates.into_iter().find(|path| path.is_file())
+    candidates
 }
 
 fn run_cli_command(
@@ -5014,6 +5029,17 @@ mod tests {
             parse_provider_cli_status(LoginProvider::Codex, &signed_out),
             (false, None)
         );
+    }
+
+    #[test]
+    fn bundled_codex_cli_is_lowest_priority_linux_fallback() {
+        let bundled = PathBuf::from("/usr/lib/chatgpt/resources/codex");
+        let candidates = cli_binary_candidates(LoginProvider::Codex);
+        if cfg!(target_os = "linux") {
+            assert_eq!(candidates.last(), Some(&bundled));
+        } else {
+            assert!(!candidates.contains(&bundled));
+        }
     }
 
     #[test]

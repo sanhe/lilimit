@@ -144,6 +144,8 @@ codex login
 claude auth login --claudeai
 ```
 
+If `codex` is not on lilimit's `PATH` (common when it is installed through a Node version manager and lilimit is started from the desktop), lilimit falls back to the native Codex CLI bundled with the ChatGPT desktop app at `/usr/lib/chatgpt/resources/codex`. A `codex` on `PATH` or in a user-local install directory still takes priority.
+
 Lilimit reads Codex credentials from `~/.codex/auth.json` and Claude credentials from `~/.claude/.credentials.json`. Its own Ubuntu data lives in `~/.config/lilimit`.
 
 ## Build on Ubuntu
